@@ -56,6 +56,16 @@ class GKDConfig(RolloutTrainerArgumentsMixin, SwiftArgumentsMixin, HfGKDConfig):
 
 
 @dataclass
+class OPSDConfig(GKDConfig):
+
+    def __post_init__(self):
+        super().__post_init__()
+        # OPSD is strictly on-policy and does not use sequential KD teacher rollout.
+        self.lmbda = 1.0
+        self.seq_kd = False
+
+
+@dataclass
 class GRPOConfig(GRPOArgumentsMixin, SwiftArgumentsMixin, HfGRPOConfig):
 
     def __post_init__(self):
