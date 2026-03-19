@@ -142,7 +142,6 @@ class RLHF(BaseUI):
         'kto': ['desirable_weight', 'undesirable_weight', 'ref_model', 'ref_model_type'],
         'simpo': ['simpo_gamma', 'cpo_alpha'],
         'gkd': ['teacher_model', 'teacher_model_type', 'max_completion_length', 'lmbda'],
-        'opsd': ['teacher_model', 'teacher_model_type', 'max_completion_length'],
         'ppo': ['reward_model', 'reward_model_type', 'max_completion_length', 'ref_model', 'ref_model_type']
     }
 
@@ -208,5 +207,5 @@ class RLHF(BaseUI):
 
     @staticmethod
     def update_beta(rlhf_type):
-        beta_value_dict = {'simpo': 2., 'gkd': 0.5, 'opsd': 0.5, 'grpo': 0.04}
+        beta_value_dict = {'simpo': 2., 'gkd': 0.5, 'grpo': 0.04}
         return beta_value_dict.get(rlhf_type, 0.1) if rlhf_type else 0.1

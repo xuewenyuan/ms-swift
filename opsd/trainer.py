@@ -11,29 +11,22 @@ from transformers import PreTrainedModel
 from trl import SFTTrainer as HFSFTTrainer
 
 from swift.llm import disable_gradient_checkpointing
+from swift.trainers.rlhf_trainer.gkd_trainer import DataSource, GKDTrainer
+from swift.trainers.rlhf_trainer.rollout_mixin import DataType
+from swift.trainers.rlhf_trainer.utils import patch_profiling_context, patch_profiling_decorator
 from swift.utils import get_logger, unwrap_model_for_generation
-from .gkd_trainer import DataSource, GKDTrainer
-from .rollout_mixin import DataType
-from .utils import patch_profiling_context, patch_profiling_decorator
 
 logger = get_logger()
 
 
 class OPSDTrainer(GKDTrainer):
-    """On-Policy Self-Distillation trainer with reference-conditioned teacher prompt.
-
-    Training flow:
-    1) Sample student rollout y from prompt x
-    2) Build student inputs with (x, y)
-    3) Build teacher inputs with (x + reference, y)
-    4) Minimize full-vocabulary divergence between teacher/student distributions on response tokens
-    """
+    """External OPSD trainer kept separate from ms-swift source registration."""
 
     _REFERENCE_KEYS = ('reference', 'ground_truth', 'solution', 'label', 'answer')
-    _REFERENCE_PLACEHOLDER = '<reference>'
 
     def __init__(self, model: Optional[Union[PreTrainedModel, nn.Module, str]] = None, *_args, **kwargs):
         args = kwargs.get('args')
+        self.reference_placeholder = getattr(args, 'reference_placeholder', '<reference>') if args is not None else '<reference>'
         if args is not None:
             if getattr(args, 'lmbda', 1.0) != 1.0:
                 logger.info('OPSD enforces lmbda=1.0, overriding args.lmbda=%s', args.lmbda)
@@ -52,8 +45,6 @@ class OPSDTrainer(GKDTrainer):
         if teacher_model is None:
             if model is None:
                 raise ValueError('OPSD requires `model` when `teacher_model` is not provided.')
-            # Bootstrap parent initialization with a temporary teacher. The actual teacher branch
-            # uses the current student model with stop-grad in compute_loss.
             teacher_model = deepcopy(model)
             teacher_model.requires_grad_(False)
             kwargs['teacher_model'] = teacher_model
@@ -82,7 +73,6 @@ class OPSDTrainer(GKDTrainer):
                         return value
                 elif isinstance(value, (int, float)):
                     return str(value)
-        # Fallback: use ground-truth assistant response if present.
         messages = sample.get('messages') or []
         if messages and messages[-1].get('role') == 'assistant':
             content = messages[-1].get('content')
@@ -92,8 +82,7 @@ class OPSDTrainer(GKDTrainer):
                     return content
         return None
 
-    @classmethod
-    def _replace_reference_placeholder(cls, messages: List[Dict[str, Any]], reference: Optional[str],
+    def _replace_reference_placeholder(self, messages: List[Dict[str, Any]], reference: Optional[str],
                                        *, use_reference: bool) -> bool:
         found_placeholder = False
         replacement = reference or '' if use_reference else ''
@@ -103,10 +92,10 @@ class OPSDTrainer(GKDTrainer):
             content = message.get('content')
             if not isinstance(content, str):
                 continue
-            if cls._REFERENCE_PLACEHOLDER not in content:
+            if self.reference_placeholder not in content:
                 continue
             found_placeholder = True
-            message['content'] = content.replace(cls._REFERENCE_PLACEHOLDER, replacement)
+            message['content'] = content.replace(self.reference_placeholder, replacement)
         return found_placeholder
 
     @staticmethod
@@ -140,13 +129,13 @@ class OPSDTrainer(GKDTrainer):
             found_placeholder = self._replace_reference_placeholder(messages, reference, use_reference=True)
             if reference and not found_placeholder:
                 warning_once = getattr(logger, 'warning_once', logger.warning)
-                warning_once('OPSD: reference is provided but `<reference>` placeholder is not found in user content.')
+                warning_once(
+                    f'OPSD: reference is provided but `{self.reference_placeholder}` placeholder is not found in user content.'
+                )
             self._ensure_last_assistant_message(messages)
             data['messages'] = messages
-
-            for key in (
-                    'response_token_ids', 'response_loss_mask', 'rollout_infos', 'rollout_logprobs', 'finish_reason',
-                    'is_truncated', 'add_eos'):
+            for key in ('response_token_ids', 'response_loss_mask', 'rollout_infos', 'rollout_logprobs', 'finish_reason',
+                        'is_truncated', 'add_eos'):
                 if key in generated_data:
                     data[key] = deepcopy(generated_data[key])
         return teacher_inputs
@@ -195,7 +184,6 @@ class OPSDTrainer(GKDTrainer):
             student_inputs = self._prepare_batch_inputs(generated_inputs, encode_prompt_only=False)
             teacher_rollout_inputs = self._build_teacher_rollout_inputs(source_inputs, generated_inputs, references)
             teacher_inputs = self._prepare_batch_inputs(teacher_rollout_inputs, encode_prompt_only=False)
-
             student_inputs['_data_source'] = DataSource.STUDENT
             student_inputs['_teacher_model_inputs'] = teacher_inputs
 
@@ -230,7 +218,6 @@ class OPSDTrainer(GKDTrainer):
 
         shifted_student_labels = torch.roll(inputs['labels'], shifts=-1, dims=1)
         shifted_teacher_labels = torch.roll(teacher_inputs['labels'], shifts=-1, dims=1)
-
         student_mask = shifted_student_labels != -100
         teacher_mask = shifted_teacher_labels != -100
         shifted_student_logits = outputs_student.logits[student_mask][None]
@@ -243,7 +230,6 @@ class OPSDTrainer(GKDTrainer):
             shifted_student_logits = shifted_student_logits[:, :min_tokens]
             shifted_teacher_logits = shifted_teacher_logits[:, :min_tokens]
 
-        # Fix potential vocab-size mismatch between student and teacher branches.
         stu_dim = shifted_student_logits.shape[-1]
         tea_dim = shifted_teacher_logits.shape[-1]
         if stu_dim < tea_dim:

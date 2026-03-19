@@ -20,7 +20,8 @@ dataset_path=./data/opsd_train.jsonl
 PYTORCH_CUDA_ALLOC_CONF='expandable_segments:True' \
 CUDA_VISIBLE_DEVICES=0,1 \
 NPROC_PER_NODE=$nproc_per_node \
-swift rlhf \
+python train.py \
+    --pipeline rlhf \
     --rlhf_type opsd \
     --model Qwen/Qwen2.5-7B-Instruct \
     --train_type lora \

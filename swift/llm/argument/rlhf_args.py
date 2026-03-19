@@ -9,7 +9,7 @@ from swift.utils import get_current_device, get_logger, is_master, is_mp, json_p
 from .train_args import TrainArguments
 
 logger = get_logger()
-rlhf_support_vllm_types = ['grpo', 'gkd', 'opsd']
+rlhf_support_vllm_types = ['grpo', 'gkd']
 
 
 @dataclass
@@ -39,8 +39,7 @@ class TeacherModelArguments:
 
     Args:
         teacher_model (Optional[str]): The model ID or a local path to the teacher model. This is required when
-            `rlhf_type` is 'gkd' and optional for 'opsd' (if omitted, OPSD clones a frozen teacher snapshot from the
-            student initialization). Analogous to the main `model` argument. Defaults to None.
+            `rlhf_type` is 'gkd'. Analogous to the main `model` argument. Defaults to None.
         teacher_adapters (List[str]): A list of paths to LoRA weights. These weights, often produced by SFT, are loaded
             to form the teacher model. Defaults to an empty list (`[]`).
         teacher_model_type (Optional[str]): The model type of the teacher model. If not specified, it's often inferred.
@@ -154,7 +153,7 @@ class RLHFArguments(TeacherModelArguments, GRPOArguments, PPOArguments, RewardMo
 
     Args:
         rlhf_type (str): The type of human alignment algorithm to use. Supports 'dpo', 'orpo', 'simpo', 'kto', 'cpo',
-            'rm', 'ppo', 'grpo', 'gkd', and 'opsd'. Defaults to 'dpo'.
+            'rm', 'ppo', 'grpo', and 'gkd'. Defaults to 'dpo'.
         ref_model (Optional[str]): The model path for the reference model. Required when using 'dpo', 'kto', 'ppo',
             or 'grpo' with full-parameter training. Defaults to None, which will set it to the value of the `--model`
             argument.
@@ -167,9 +166,9 @@ class RLHFArguments(TeacherModelArguments, GRPOArguments, PPOArguments, RewardMo
             Defaults to None.
         beta (Optional[float]): The beta parameter for RLHF, controlling the deviation from the reference model.
             A higher value implies less deviation. If None, uses algorithm-specific defaults: 2.0 for 'simpo', 0.04
-            for 'grpo', 0.5 for 'gkd'/'opsd', and 0.1 for others. Defaults to None.
+            for 'grpo', 0.5 for 'gkd', and 0.1 for others. Defaults to None.
         label_smoothing (float): The label smoothing value for DPO. A value of 0 disables it. Defaults to 0.
-        max_completion_length (int): The maximum generation length for GRPO/PPO/GKD/OPSD algorithms. Defaults to 512.
+        max_completion_length (int): The maximum generation length for GRPO/PPO/GKD algorithms. Defaults to 512.
         loss_scale (Optional[str]): Overrides the template parameter. During RLHF training, this defaults to
             'last_round'.
         rpo_alpha (Optional[float]): The alpha parameter from the RPO paper, controlling the weight of the SFT loss
@@ -192,20 +191,17 @@ class RLHFArguments(TeacherModelArguments, GRPOArguments, PPOArguments, RewardMo
             Defaults to 1.0.
         undesirable_weight (float): In KTO, the weight applied to the undesirable loss to counteract data imbalance.
             Defaults to 1.0.
-        temperature (float): The temperature for sampling, used in PPO, GRPO, GKD, and OPSD algorithms. Defaults to
-            0.9.
+        temperature (float): The temperature for sampling, used in PPO, GRPO, and GKD algorithms. Defaults to 0.9.
         center_rewards_coefficient (Optional[float]): Used for Reward Model (RM) training. A coefficient to encourage
             the reward model to output rewards with a mean of zero. A value of 0.01 is recommended. Defaults to None.
-        lmbda (float): The probability of on-policy student rollout for GKD/OPSD. OPSD enforces lmbda=1.0. Defaults
-            to 0.5.
-        seq_kd (bool): Whether to use sequence-level knowledge distillation for GKD. OPSD enforces this to False.
-            Defaults to False.
-        offload_teacher_model (bool): Whether to offload the teacher model to CPU memory to save VRAM during GKD/OPSD
+        lmbda (float): The lambda parameter for GKD, balancing policy and value losses. Defaults to 0.5.
+        seq_kd (bool): Whether to use sequence-level knowledge distillation for GKD. Defaults to False.
+        offload_teacher_model (bool): Whether to offload the teacher model to CPU memory to save VRAM during GKD
             training. Defaults to False.
         max_new_tokens (Optional[int]): A backward-compatibility argument. Please use `max_completion_length` instead.
             Defaults to None.
     """
-    rlhf_type: Literal['dpo', 'orpo', 'simpo', 'kto', 'cpo', 'rm', 'ppo', 'grpo', 'gkd', 'opsd'] = 'dpo'
+    rlhf_type: Literal['dpo', 'orpo', 'simpo', 'kto', 'cpo', 'rm', 'ppo', 'grpo', 'gkd'] = 'dpo'
     ref_model: Optional[str] = None
     ref_adapters: List[str] = field(default_factory=list)
     ref_model_type: Optional[str] = field(
@@ -229,7 +225,7 @@ class RLHFArguments(TeacherModelArguments, GRPOArguments, PPOArguments, RewardMo
     # KTO
     desirable_weight: float = 1.0
     undesirable_weight: float = 1.0
-    # PPO/GRPO/GKD/OPSD
+    # PPO/GRPO/GKD
     temperature: float = 0.9
     # RM
     center_rewards_coefficient: Optional[float] = None
@@ -247,7 +243,6 @@ class RLHFArguments(TeacherModelArguments, GRPOArguments, PPOArguments, RewardMo
     def __post_init__(self):
         self._process_loss_type()
         self._init_grpo()
-        self._init_opsd()
         self._init_rm()
         self._init_simpo()
         self._init_max_completion_length()
@@ -260,7 +255,6 @@ class RLHFArguments(TeacherModelArguments, GRPOArguments, PPOArguments, RewardMo
         self._check_sequence_parallel()
         self._check_grpo()
         self._check_gkd()
-        self._check_opsd()
 
         if self.loss_scale is None:
             if self.rlhf_type == 'orpo' and not self.model_meta.is_multimodal:
@@ -358,21 +352,6 @@ class RLHFArguments(TeacherModelArguments, GRPOArguments, PPOArguments, RewardMo
             else:
                 raise ValueError(f'Invalid advantage_estimator: {self.advantage_estimator}')
 
-    def _init_opsd(self):
-        if self.rlhf_type != 'opsd':
-            return
-
-        self.remove_unused_columns = False
-        logger.info(f'Setting args.remove_unused_columns: {self.remove_unused_columns}')
-
-        if self.lmbda != 1.0:
-            logger.info('OPSD enforces lmbda=1.0, overriding lmbda=%s', self.lmbda)
-            self.lmbda = 1.0
-
-        if self.seq_kd:
-            logger.warning('OPSD does not support seq_kd. Forcing seq_kd=False.')
-            self.seq_kd = False
-
     def _init_rollout(self):
         if self.rlhf_type not in rlhf_support_vllm_types:
             return
@@ -400,7 +379,7 @@ class RLHFArguments(TeacherModelArguments, GRPOArguments, PPOArguments, RewardMo
         self._external_vllm_warning()
 
     def _init_padding_side(self):
-        if self.rlhf_type in {'ppo', 'gkd', 'opsd'}:
+        if self.rlhf_type in {'ppo', 'gkd'}:
             self.padding_side = 'left'
             # TODO: streaming, MLLM
 
@@ -448,7 +427,7 @@ class RLHFArguments(TeacherModelArguments, GRPOArguments, PPOArguments, RewardMo
 
     def _set_default(self):
         if self.beta is None:
-            if self.rlhf_type in {'gkd', 'opsd'}:
+            if self.rlhf_type == 'gkd':
                 self.beta = 0.5
             else:
                 self.beta = 0.1
@@ -518,7 +497,7 @@ class RLHFArguments(TeacherModelArguments, GRPOArguments, PPOArguments, RewardMo
     def _check_padding_free(self):
         super()._check_padding_free()
         if self.padding_free or self.packing:
-            supported_types = ['grpo', 'dpo', 'kto', 'gkd', 'opsd']
+            supported_types = ['grpo', 'dpo', 'kto', 'gkd']
             if self.rlhf_type not in supported_types:
                 raise NotImplementedError(
                     f"The current rlhf_type '{self.rlhf_type}' does not support padding_free/packing. "
@@ -568,18 +547,3 @@ class RLHFArguments(TeacherModelArguments, GRPOArguments, PPOArguments, RewardMo
 
         if self.async_generate:
             raise NotImplementedError('Currently, async_generate is not supported for GKD.')
-
-    def _check_opsd(self):
-        if self.rlhf_type != 'opsd':
-            return
-        if self.teacher_model is None and self.teacher_deepspeed:
-            logger.warning('teacher_deepspeed is ignored for OPSD when teacher_model is not set.')
-        if is_mp() and self.use_vllm:
-            raise ValueError('OPSD with vLLM is not compatible with `device_map`. '
-                             'Please set NPROC_PER_NODE equal to num_processes.')
-
-        if self.multi_turn_scheduler is not None:
-            raise NotImplementedError('Currently, multi_turn_scheduler is not supported for OPSD.')
-
-        if self.async_generate:
-            raise NotImplementedError('Currently, async_generate is not supported for OPSD.')
