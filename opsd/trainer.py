@@ -114,15 +114,35 @@ class OPSDTrainer(GKDTrainer):
         if not messages or messages[-1].get('role') != 'assistant':
             messages.append({'role': 'assistant', 'content': None})
 
-    @staticmethod
-    def _filter_model_inputs(model: nn.Module, model_inputs: Dict[str, Any]) -> Dict[str, Any]:
+    def _filter_model_inputs(self, model: nn.Module, model_inputs: Dict[str, Any]) -> Dict[str, Any]:
+        allowed_keys = {
+            'input_ids',
+            'attention_mask',
+            'position_ids',
+            'text_position_ids',
+            'token_type_ids',
+            'inputs_embeds',
+            'pixel_values',
+            'pixel_values_videos',
+            'image_grid_thw',
+            'video_grid_thw',
+            'labels',
+            'logits_to_keep',
+            'loss_scale',
+            'loss_scale_mask',
+        }
+        processing_class = getattr(self, 'processing_class', None)
+        if processing_class is not None:
+            allowed_keys.update(getattr(processing_class, 'model_input_names', []) or [])
+
         try:
             forward_params = inspect.signature(model.forward).parameters
         except (TypeError, ValueError):
-            return model_inputs
+            return {k: v for k, v in model_inputs.items() if k in allowed_keys}
         if any(param.kind == inspect.Parameter.VAR_KEYWORD for param in forward_params.values()):
-            return model_inputs
-        return {k: v for k, v in model_inputs.items() if k in forward_params}
+            return {k: v for k, v in model_inputs.items() if k in allowed_keys}
+        allowed_keys.update(forward_params)
+        return {k: v for k, v in model_inputs.items() if k in allowed_keys}
 
     def _build_student_prompt_inputs(self, source_inputs: DataType, references: List[Optional[str]]) -> DataType:
         student_inputs = deepcopy(source_inputs)
@@ -181,8 +201,12 @@ class OPSDTrainer(GKDTrainer):
                         model, self.accelerator,
                         gather_deepspeed3_params=args.ds3_gather_for_generation) as unwrapped_model:
                     unwrapped_model.eval()
+                    generation_inputs = dict(prompt_inputs)
+                    generation_model_inputs = {k: v for k, v in generation_inputs.items() if k != 'labels'}
+                    generation_model_inputs = self._filter_model_inputs(unwrapped_model, generation_model_inputs)
+                    generation_inputs = dict(generation_model_inputs)
                     _, _, generated_labels = self.generate_on_policy_outputs(
-                        unwrapped_model, prompt_inputs, self.generation_config, self.processing_class.pad_token_id)
+                        unwrapped_model, generation_inputs, self.generation_config, self.processing_class.pad_token_id)
                     unwrapped_model.train()
 
                 response_token_ids = self._extract_response_token_ids(
