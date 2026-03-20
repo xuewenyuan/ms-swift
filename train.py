@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 from typing import List, Optional
 
-from swift.llm.train import SwiftPt, SwiftRLHF, SwiftSft
+from swift.llm.train import SwiftRLHF, SwiftSft
 from swift.utils import parse_args
 
 

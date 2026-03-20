@@ -1,6 +1,6 @@
 import os
 from dataclasses import dataclass
-from typing import Any, Dict, List, Literal, Optional
+from typing import List, Literal, Optional
 
 from swift.llm.argument.rlhf_args import GRPOArguments, RLHFArguments, rlhf_support_vllm_types
 from swift.llm.argument.train_args import TrainArguments
@@ -42,9 +42,6 @@ class OPSDArguments(RLHFArguments):
             self.ref_adapters = [self.ref_adapters]
         if self.ref_model is not None:
             raise ValueError('OPSD does not require a ref_model to be passed in.')
-
-    def _prepare_training_args(self, training_args: Dict[str, Any]) -> None:
-        return None
 
     def _init_opsd_padding_side(self):
         self.padding_side = 'left'

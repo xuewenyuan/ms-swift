@@ -76,11 +76,9 @@ class SwiftOPSD(SwiftRLHF):
             if result is not None:
                 model, _ = result
                 self.teacher_model = model
-                self._set_main_input_name(self.teacher_model)
 
         from swift.llm.train.sft import SwiftSft
         SwiftSft._prepare_model_tokenizer(self)
-        self._set_main_input_name(self.model)
 
     def _prepare_template(self) -> None:
         from swift.llm.train.sft import SwiftSft
@@ -109,7 +107,6 @@ class SwiftOPSD(SwiftRLHF):
 
         data_collator = self._get_data_collator()
         self.model = self.prepare_model(self.args, self.model, template=self.template, train_dataset=train_dataset)
-        self._set_main_input_name(self.model)
         logger.info(f'model: {self.model}')
         model_parameter_info = get_model_parameter_info(self.model)
         self.train_msg['model_parameter_info'] = model_parameter_info
@@ -125,6 +122,10 @@ class SwiftOPSD(SwiftRLHF):
             template=self.template,
             **self._get_trainer_kwargs(),
         )
+        if hasattr(trainer.args, 'include_num_input_tokens_seen'):
+            trainer.args.include_num_input_tokens_seen = False
+        self._set_main_input_name(trainer.model)
+        self._set_main_input_name(getattr(trainer, 'model_wrapped', None))
         return self.train(trainer)
 
 

@@ -74,13 +74,6 @@ class OPSDTrainer(GKDTrainer):
                         return value
                 elif isinstance(value, (int, float)):
                     return str(value)
-        messages = sample.get('messages') or []
-        if messages and messages[-1].get('role') == 'assistant':
-            content = messages[-1].get('content')
-            if isinstance(content, str):
-                content = content.strip()
-                if content:
-                    return content
         return None
 
     def _replace_reference_placeholder(self, messages: List[Dict[str, Any]], reference: Optional[str],
@@ -113,6 +106,20 @@ class OPSDTrainer(GKDTrainer):
     def _ensure_last_assistant_message(messages: List[Dict[str, Any]]) -> None:
         if not messages or messages[-1].get('role') != 'assistant':
             messages.append({'role': 'assistant', 'content': None})
+
+    def _accumulate_seen_tokens(self, model_inputs: Dict[str, Any]) -> None:
+        attention_mask = model_inputs.get('attention_mask')
+        if attention_mask is None:
+            return
+        local_tokens = attention_mask.sum().to(dtype=torch.long)
+        if self.accelerator.num_processes > 1:
+            gathered_tokens = self.accelerator.gather(local_tokens.reshape(1))
+            total_tokens = gathered_tokens.sum().item()
+        else:
+            total_tokens = local_tokens.item()
+        self._last_step_tokens = int(total_tokens)
+        current_seen = getattr(self.state, 'num_input_tokens_seen', 0) or 0
+        self.state.num_input_tokens_seen = current_seen + self._last_step_tokens
 
     def _filter_model_inputs(self, model: nn.Module, model_inputs: Dict[str, Any]) -> Dict[str, Any]:
         allowed_keys = {
@@ -219,6 +226,7 @@ class OPSDTrainer(GKDTrainer):
             student_inputs = self._prepare_batch_inputs(generated_inputs, encode_prompt_only=False)
             teacher_rollout_inputs = self._build_teacher_rollout_inputs(source_inputs, generated_inputs, references)
             teacher_inputs = self._prepare_batch_inputs(teacher_rollout_inputs, encode_prompt_only=False)
+            self._accumulate_seen_tokens(student_inputs)
             student_inputs['_data_source'] = DataSource.STUDENT
             student_inputs['_teacher_model_inputs'] = teacher_inputs
 
