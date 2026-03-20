@@ -16,6 +16,15 @@ class SwiftOPSD(SwiftRLHF):
     args_class = OPSDArguments
     args: args_class
 
+    @staticmethod
+    def _set_main_input_name(model) -> None:
+        if model is None:
+            return
+        model.main_input_name = 'input_ids'
+        inner_model = getattr(model, 'model', None)
+        if inner_model is not None:
+            inner_model.main_input_name = 'input_ids'
+
     @RayHelper.function(group='default')
     def _prepare_dataset(self):
         args = self.args
@@ -52,9 +61,11 @@ class SwiftOPSD(SwiftRLHF):
             if result is not None:
                 model, _ = result
                 self.teacher_model = model
+                self._set_main_input_name(self.teacher_model)
 
         from swift.llm.train.sft import SwiftSft
         SwiftSft._prepare_model_tokenizer(self)
+        self._set_main_input_name(self.model)
 
     def _prepare_template(self) -> None:
         from swift.llm.train.sft import SwiftSft
