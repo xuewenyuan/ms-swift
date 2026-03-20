@@ -1,6 +1,8 @@
 from typing import List, Optional, Union
 
 from swift.ray import RayHelper
+from swift.llm.infer import get_cached_dataset
+from swift.llm.dataset.loader import DatasetLoader
 from swift.utils import get_logger, get_model_parameter_info
 from swift.llm.train.rlhf import SwiftRLHF
 
@@ -13,6 +15,30 @@ logger = get_logger()
 class SwiftOPSD(SwiftRLHF):
     args_class = OPSDArguments
     args: args_class
+
+    @RayHelper.function(group='default')
+    def _prepare_dataset(self):
+        args = self.args
+        # OPSD needs raw `messages` during rollout, so encoding must be deferred to training.
+        pre_process = False
+        if args.cached_dataset or args.cached_val_dataset:
+            assert not args.streaming, 'Cached dataset does not support streaming.'
+            train_datasets, val_datasets = get_cached_dataset(self.args)
+        else:
+            train_datasets, val_datasets = [], []
+        if args.dataset or args.val_dataset:
+            train_dataset, val_dataset = self._get_dataset()
+            train_dataset, val_dataset = self._encode_dataset(train_dataset, val_dataset, pre_process=pre_process)
+            if train_dataset is not None:
+                train_datasets.append(train_dataset)
+            if val_dataset is not None:
+                val_datasets.append(val_dataset)
+        train_dataset = DatasetLoader._concat_datasets(train_datasets)
+        val_dataset = DatasetLoader._concat_datasets(val_datasets)
+        if args.truncation_strategy != 'split':
+            logger.info(f'train_dataset: {train_dataset}')
+            logger.info(f'val_dataset: {val_dataset}')
+        return [train_dataset, val_dataset]
 
     def _prepare_model_tokenizer(self):
         args = self.args

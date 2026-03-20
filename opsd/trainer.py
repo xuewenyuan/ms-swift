@@ -1,6 +1,7 @@
 # Copyright (c) Alibaba, Inc. and its affiliates.
 from contextlib import nullcontext
 from copy import deepcopy
+import inspect
 from typing import Any, Dict, List, Optional, Union
 
 import torch
@@ -113,6 +114,16 @@ class OPSDTrainer(GKDTrainer):
         if not messages or messages[-1].get('role') != 'assistant':
             messages.append({'role': 'assistant', 'content': None})
 
+    @staticmethod
+    def _filter_model_inputs(model: nn.Module, model_inputs: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            forward_params = inspect.signature(model.forward).parameters
+        except (TypeError, ValueError):
+            return model_inputs
+        if any(param.kind == inspect.Parameter.VAR_KEYWORD for param in forward_params.values()):
+            return model_inputs
+        return {k: v for k, v in model_inputs.items() if k in forward_params}
+
     def _build_student_prompt_inputs(self, source_inputs: DataType, references: List[Optional[str]]) -> DataType:
         student_inputs = deepcopy(source_inputs)
         for data, reference in zip(student_inputs, references):
@@ -198,6 +209,7 @@ class OPSDTrainer(GKDTrainer):
             return super().compute_loss(model, inputs, return_outputs=return_outputs, num_items_in_batch=num_items_in_batch)
 
         student_model_inputs = {k: v for k, v in inputs.items() if k not in {'prompt', 'labels'}}
+        student_model_inputs = self._filter_model_inputs(model, student_model_inputs)
         outputs_student = model(**student_model_inputs)
 
         teacher_model_inputs = {k: v for k, v in teacher_inputs.items() if k not in {'prompt', 'labels'}}
@@ -207,6 +219,7 @@ class OPSDTrainer(GKDTrainer):
         else:
             teacher_model = self.teacher_model
             load_context = self.load_teacher_model_context() if self.args.offload_teacher_model else nullcontext()
+        teacher_model_inputs = self._filter_model_inputs(teacher_model, teacher_model_inputs)
 
         was_training = teacher_model.training
         with torch.no_grad(), load_context, disable_gradient_checkpointing(teacher_model,
