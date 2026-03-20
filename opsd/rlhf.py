@@ -20,10 +20,25 @@ class SwiftOPSD(SwiftRLHF):
     def _set_main_input_name(model) -> None:
         if model is None:
             return
-        model.main_input_name = 'input_ids'
-        inner_model = getattr(model, 'model', None)
-        if inner_model is not None:
-            inner_model.main_input_name = 'input_ids'
+        visited = set()
+        queue = [model]
+        while queue:
+            current = queue.pop(0)
+            if current is None or id(current) in visited:
+                continue
+            visited.add(id(current))
+            try:
+                current.main_input_name = 'input_ids'
+            except Exception:
+                pass
+            try:
+                current.__class__.main_input_name = 'input_ids'
+            except Exception:
+                pass
+            for attr in ('model', 'module', 'base_model'):
+                next_model = getattr(current, attr, None)
+                if next_model is not None and id(next_model) not in visited:
+                    queue.append(next_model)
 
     @RayHelper.function(group='default')
     def _prepare_dataset(self):
@@ -94,6 +109,7 @@ class SwiftOPSD(SwiftRLHF):
 
         data_collator = self._get_data_collator()
         self.model = self.prepare_model(self.args, self.model, template=self.template, train_dataset=train_dataset)
+        self._set_main_input_name(self.model)
         logger.info(f'model: {self.model}')
         model_parameter_info = get_model_parameter_info(self.model)
         self.train_msg['model_parameter_info'] = model_parameter_info
