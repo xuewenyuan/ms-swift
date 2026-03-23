@@ -13,6 +13,7 @@ logger = get_logger()
 class OPSDArguments(RLHFArguments):
     rlhf_type: Literal['opsd'] = 'opsd'
     reference_placeholder: str = '<reference>'
+    opsd_teacher_mode: Literal['snapshot', 'shared'] = 'snapshot'
 
     def __post_init__(self):
         self._process_loss_type()

@@ -28,6 +28,7 @@ class OPSDTrainer(GKDTrainer):
     def __init__(self, model: Optional[Union[PreTrainedModel, nn.Module, str]] = None, *_args, **kwargs):
         args = kwargs.get('args')
         self.reference_placeholder = getattr(args, 'reference_placeholder', '<reference>') if args is not None else '<reference>'
+        self.opsd_teacher_mode = getattr(args, 'opsd_teacher_mode', 'snapshot') if args is not None else 'snapshot'
         if args is not None:
             if getattr(args, 'lmbda', 1.0) != 1.0:
                 logger.info('OPSD enforces lmbda=1.0, overriding args.lmbda=%s', args.lmbda)
@@ -37,9 +38,6 @@ class OPSDTrainer(GKDTrainer):
                 args.seq_kd = False
             if getattr(args, 'use_liger_kernel', False):
                 raise NotImplementedError('OPSD currently does not support `use_liger_kernel`.')
-            if getattr(args, 'sft_alpha', 0) > 0:
-                logger.warning('OPSD ignores sft_alpha during on-policy divergence training. Forcing sft_alpha=0.')
-                args.sft_alpha = 0
 
         teacher_model = kwargs.get('teacher_model')
         self._use_student_as_teacher = teacher_model is None
@@ -49,10 +47,13 @@ class OPSDTrainer(GKDTrainer):
             teacher_model = deepcopy(model)
             teacher_model.requires_grad_(False)
             kwargs['teacher_model'] = teacher_model
-            logger.info('OPSD teacher will share student weights during loss computation (stop-grad branch).')
+            if self.opsd_teacher_mode == 'shared':
+                logger.info('OPSD teacher will share student weights during loss computation (stop-grad branch).')
+            else:
+                logger.info('OPSD teacher will use a frozen snapshot initialized from student weights.')
 
         super().__init__(model, *_args, **kwargs)
-        if self._use_student_as_teacher:
+        if self._use_student_as_teacher and self.opsd_teacher_mode == 'shared':
             teacher_snapshot = self.teacher_model
             self.teacher_model = self.model
             if self.args.offload_teacher_model:
@@ -120,6 +121,28 @@ class OPSDTrainer(GKDTrainer):
         self._last_step_tokens = int(total_tokens)
         current_seen = getattr(self.state, 'num_input_tokens_seen', 0) or 0
         self.state.num_input_tokens_seen = current_seen + self._last_step_tokens
+
+    def _update_rollout_metrics(self, response_token_ids: List[List[int]]) -> None:
+        if not response_token_ids:
+            return
+        lengths = [len(ids) for ids in response_token_ids]
+        if lengths:
+            self.custom_metrics['train']['rollout_response_len'].update(sum(lengths) / len(lengths))
+        repeat_ratios = []
+        eos_token_id = getattr(self.processing_class, 'eos_token_id', None)
+        eos_hits = 0
+        valid_eos_count = 0
+        for ids in response_token_ids:
+            if len(ids) > 1:
+                adjacent_repeats = sum(1 for i in range(1, len(ids)) if ids[i] == ids[i - 1])
+                repeat_ratios.append(adjacent_repeats / (len(ids) - 1))
+            if eos_token_id is not None and ids:
+                valid_eos_count += 1
+                eos_hits += int(ids[-1] == eos_token_id)
+        if repeat_ratios:
+            self.custom_metrics['train']['rollout_repeat_ratio'].update(sum(repeat_ratios) / len(repeat_ratios))
+        if valid_eos_count > 0:
+            self.custom_metrics['train']['rollout_eos_rate'].update(eos_hits / valid_eos_count)
 
     def _filter_model_inputs(self, model: nn.Module, model_inputs: Dict[str, Any]) -> Dict[str, Any]:
         allowed_keys = {
@@ -195,6 +218,8 @@ class OPSDTrainer(GKDTrainer):
             if args.use_vllm:
                 processed_inputs = self._preprocess_inputs(student_source_inputs)
                 generated_inputs = self._fast_infer(processed_inputs)
+                response_token_ids = [data.get('response_token_ids', []) for data in generated_inputs]
+                self._update_rollout_metrics(response_token_ids)
                 if self.log_completions:
                     messages = [inp['messages'][:-1] for inp in generated_inputs]
                     completions = [deepcopy(inp['messages'][-1]['content']) for inp in generated_inputs]
@@ -218,6 +243,7 @@ class OPSDTrainer(GKDTrainer):
 
                 response_token_ids = self._extract_response_token_ids(
                     generated_labels, getattr(self.processing_class, 'eos_token_id', None))
+                self._update_rollout_metrics(response_token_ids)
                 generated_inputs = deepcopy(student_source_inputs)
                 for data, token_ids in zip(generated_inputs, response_token_ids):
                     self._ensure_last_assistant_message(data['messages'])
@@ -241,6 +267,8 @@ class OPSDTrainer(GKDTrainer):
             return super().compute_loss(model, inputs, return_outputs=return_outputs, num_items_in_batch=num_items_in_batch)
 
         student_model_inputs = {k: v for k, v in inputs.items() if k not in {'prompt', 'labels'}}
+        if self.args.sft_alpha > 0:
+            student_model_inputs['labels'] = inputs['labels']
         student_model_inputs = self._filter_model_inputs(model, student_model_inputs)
         outputs_student = model(**student_model_inputs)
 
@@ -289,6 +317,8 @@ class OPSDTrainer(GKDTrainer):
             teacher_logits=shifted_teacher_logits,
             beta=self.beta,
         )
+        if self.args.sft_alpha > 0:
+            loss = loss + self.args.sft_alpha * outputs_student.loss
 
         if return_outputs:
             return (loss, outputs_student)
