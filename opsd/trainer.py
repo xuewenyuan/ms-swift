@@ -2,6 +2,7 @@
 from contextlib import nullcontext
 from copy import deepcopy
 import inspect
+import json
 from typing import Any, Dict, List, Optional, Union
 
 import torch
@@ -29,6 +30,9 @@ class OPSDTrainer(GKDTrainer):
         args = kwargs.get('args')
         self.reference_placeholder = getattr(args, 'reference_placeholder', '<reference>') if args is not None else '<reference>'
         self.opsd_teacher_mode = getattr(args, 'opsd_teacher_mode', 'snapshot') if args is not None else 'snapshot'
+        self.opsd_loss_scope = getattr(args, 'opsd_loss_scope', 'full') if args is not None else 'full'
+        self.opsd_action_json_keys = list(getattr(args, 'opsd_action_json_keys', []) or []) if args is not None else []
+        self.opsd_action_choices = set(getattr(args, 'opsd_action_choices', []) or []) if args is not None else set()
         if args is not None:
             if getattr(args, 'lmbda', 1.0) != 1.0:
                 logger.info('OPSD enforces lmbda=1.0, overriding args.lmbda=%s', args.lmbda)
@@ -108,6 +112,77 @@ class OPSDTrainer(GKDTrainer):
         if not messages or messages[-1].get('role') != 'assistant':
             messages.append({'role': 'assistant', 'content': None})
 
+    def _get_response_text(self, response_token_ids: List[int]) -> str:
+        return self.processing_class.decode(response_token_ids, skip_special_tokens=False)
+
+    @staticmethod
+    def _get_json_value_by_path(data: Dict[str, Any], key_path: str) -> Any:
+        current: Any = data
+        for key in key_path.split('.'):
+            if not isinstance(current, dict) or key not in current:
+                return None
+            current = current[key]
+        return current
+
+    def _build_action_value_mask(self, response_token_ids: List[int], key_names: List[str]) -> Optional[torch.Tensor]:
+        if not response_token_ids or not key_names:
+            return None
+        response_text = self._get_response_text(response_token_ids)
+        try:
+            parsed = json.loads(response_text)
+        except Exception:
+            return None
+        if not isinstance(parsed, dict):
+            return None
+
+        loss_mask = torch.zeros(len(response_token_ids), dtype=torch.bool)
+        matched_any = False
+        search_start = 0
+        for key_path in key_names:
+            value = self._get_json_value_by_path(parsed, key_path)
+            if value is None:
+                continue
+            if self.opsd_action_choices and value not in self.opsd_action_choices:
+                warning_once = getattr(logger, 'warning_once', logger.warning)
+                warning_once(
+                    'OPSD action_json_values skipped one value because it is not in `opsd_action_choices`: %s', value)
+                continue
+            leaf_key = key_path.split('.')[-1]
+            value_text = json.dumps(value, ensure_ascii=False)
+            key_pattern = f'"{leaf_key}"'
+            key_index = response_text.find(key_pattern, search_start)
+            if key_index < 0:
+                continue
+            colon_index = response_text.find(':', key_index + len(key_pattern))
+            if colon_index < 0:
+                continue
+            value_start = response_text.find(value_text, colon_index + 1)
+            if value_start < 0:
+                continue
+            prefix_ids = self.processing_class.encode(response_text[:value_start], add_special_tokens=False)
+            value_ids = self.processing_class.encode(value_text, add_special_tokens=False)
+            if not value_ids:
+                continue
+            start_idx = len(prefix_ids)
+            end_idx = min(len(response_token_ids), start_idx + len(value_ids))
+            if start_idx >= len(response_token_ids):
+                continue
+            loss_mask[start_idx:end_idx] = True
+            search_start = value_start + len(value_text)
+            matched_any = True
+        if not matched_any:
+            return None
+        return loss_mask
+
+    def _build_rollout_value_masks(self, response_token_ids: List[List[int]]) -> Optional[List[Optional[torch.Tensor]]]:
+        if self.opsd_loss_scope != 'action_json_values':
+            return None
+        if not self.opsd_action_json_keys:
+            warning_once = getattr(logger, 'warning_once', logger.warning)
+            warning_once('OPSD action_json_values loss scope requires `opsd_action_json_keys`; falling back to full response loss.')
+            return None
+        return [self._build_action_value_mask(ids, self.opsd_action_json_keys) for ids in response_token_ids]
+
     def _accumulate_seen_tokens(self, model_inputs: Dict[str, Any]) -> None:
         attention_mask = model_inputs.get('attention_mask')
         if attention_mask is None:
@@ -159,7 +234,6 @@ class OPSDTrainer(GKDTrainer):
             'labels',
             'logits_to_keep',
             'loss_scale',
-            'loss_scale_mask',
         }
         processing_class = getattr(self, 'processing_class', None)
         if processing_class is not None:
@@ -201,6 +275,32 @@ class OPSDTrainer(GKDTrainer):
                     data[key] = deepcopy(generated_data[key])
         return teacher_inputs
 
+    def _prepare_batch_inputs(self, inputs: list, encode_prompt_only: bool = False) -> Dict[str, torch.Tensor]:
+        from swift.llm import to_device
+        from swift.trainers.rlhf_trainer.utils import replace_assistant_response_with_ids
+
+        template = self.template
+        batch_encoded_inputs = []
+
+        mode = 'pt' if encode_prompt_only else 'train'
+        with self._template_context(template, mode=mode):
+            for data in inputs:
+                if 'response_token_ids' in data and data['response_token_ids']:
+                    data['messages'] = replace_assistant_response_with_ids(
+                        data['messages'], data['response_token_ids'], data.get('response_loss_mask'))
+
+                if encode_prompt_only:
+                    messages = data.get('messages', [])
+                    if messages and messages[-1].get('role') == 'assistant':
+                        messages[-1]['content'] = None
+
+                encoded = template.encode(data, return_length=True)
+                batch_encoded_inputs.append(encoded)
+
+            batch_encoded = to_device(template.data_collator(batch_encoded_inputs), self.model.device)
+
+        return batch_encoded
+
     @patch_profiling_decorator
     def training_step(self,
                       model: nn.Module,
@@ -220,6 +320,11 @@ class OPSDTrainer(GKDTrainer):
                 generated_inputs = self._fast_infer(processed_inputs)
                 response_token_ids = [data.get('response_token_ids', []) for data in generated_inputs]
                 self._update_rollout_metrics(response_token_ids)
+                response_value_masks = self._build_rollout_value_masks(response_token_ids)
+                if response_value_masks is not None:
+                    for data, value_mask in zip(generated_inputs, response_value_masks):
+                        if value_mask is not None:
+                            data['response_loss_mask'] = value_mask.tolist()
                 if self.log_completions:
                     messages = [inp['messages'][:-1] for inp in generated_inputs]
                     completions = [deepcopy(inp['messages'][-1]['content']) for inp in generated_inputs]
@@ -244,10 +349,13 @@ class OPSDTrainer(GKDTrainer):
                 response_token_ids = self._extract_response_token_ids(
                     generated_labels, getattr(self.processing_class, 'eos_token_id', None))
                 self._update_rollout_metrics(response_token_ids)
+                response_value_masks = self._build_rollout_value_masks(response_token_ids)
                 generated_inputs = deepcopy(student_source_inputs)
-                for data, token_ids in zip(generated_inputs, response_token_ids):
+                for index, (data, token_ids) in enumerate(zip(generated_inputs, response_token_ids)):
                     self._ensure_last_assistant_message(data['messages'])
                     data['response_token_ids'] = token_ids
+                    if response_value_masks is not None and response_value_masks[index] is not None:
+                        data['response_loss_mask'] = response_value_masks[index].tolist()
 
             student_inputs = self._prepare_batch_inputs(generated_inputs, encode_prompt_only=False)
             teacher_rollout_inputs = self._build_teacher_rollout_inputs(source_inputs, generated_inputs, references)
@@ -293,6 +401,15 @@ class OPSDTrainer(GKDTrainer):
         shifted_teacher_labels = torch.roll(teacher_inputs['labels'], shifts=-1, dims=1)
         student_mask = shifted_student_labels != -100
         teacher_mask = shifted_teacher_labels != -100
+        if self.opsd_loss_scope == 'action_json_values':
+            student_loss_mask = inputs.get('loss_scale')
+            teacher_loss_mask = teacher_inputs.get('loss_scale')
+            if student_loss_mask is not None:
+                student_loss_mask = torch.roll(student_loss_mask.to(dtype=torch.bool), shifts=-1, dims=1)
+                student_mask = student_mask & student_loss_mask
+            if teacher_loss_mask is not None:
+                teacher_loss_mask = torch.roll(teacher_loss_mask.to(dtype=torch.bool), shifts=-1, dims=1)
+                teacher_mask = teacher_mask & teacher_loss_mask
         shifted_student_logits = outputs_student.logits[student_mask][None]
         shifted_teacher_logits = outputs_teacher.logits[teacher_mask][None]
 

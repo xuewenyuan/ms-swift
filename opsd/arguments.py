@@ -14,6 +14,9 @@ class OPSDArguments(RLHFArguments):
     rlhf_type: Literal['opsd'] = 'opsd'
     reference_placeholder: str = '<reference>'
     opsd_teacher_mode: Literal['snapshot', 'shared'] = 'snapshot'
+    opsd_loss_scope: Literal['full', 'action_json_values'] = 'full'
+    opsd_action_json_keys: Optional[List[str]] = None
+    opsd_action_choices: Optional[List[str]] = None
 
     def __post_init__(self):
         self._process_loss_type()
@@ -43,6 +46,10 @@ class OPSDArguments(RLHFArguments):
             self.ref_adapters = [self.ref_adapters]
         if self.ref_model is not None:
             raise ValueError('OPSD does not require a ref_model to be passed in.')
+        if isinstance(self.opsd_action_json_keys, str):
+            self.opsd_action_json_keys = [self.opsd_action_json_keys]
+        if isinstance(self.opsd_action_choices, str):
+            self.opsd_action_choices = [self.opsd_action_choices]
 
     def _init_opsd_padding_side(self):
         self.padding_side = 'left'
