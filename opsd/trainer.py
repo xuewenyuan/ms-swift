@@ -183,6 +183,38 @@ class OPSDTrainer(GKDTrainer):
             return None
         return [self._build_action_value_mask(ids, self.opsd_action_json_keys) for ids in response_token_ids]
 
+    def _update_action_mask_metrics(self, response_token_ids: List[List[int]],
+                                    response_value_masks: Optional[List[Optional[torch.Tensor]]]) -> None:
+        if self.opsd_loss_scope != 'action_json_values' or response_value_masks is None or not response_token_ids:
+            return
+
+        valid_samples = 0
+        total_samples = len(response_token_ids)
+        total_response_tokens = 0
+        total_masked_tokens = 0
+        per_sample_mask_ratio = []
+
+        for token_ids, value_mask in zip(response_token_ids, response_value_masks):
+            response_len = len(token_ids)
+            total_response_tokens += response_len
+            if value_mask is None:
+                per_sample_mask_ratio.append(0.0)
+                continue
+
+            valid_samples += 1
+            masked_tokens = int(value_mask.sum().item())
+            total_masked_tokens += masked_tokens
+            per_sample_mask_ratio.append(masked_tokens / response_len if response_len > 0 else 0.0)
+
+        self.custom_metrics['train']['opsd_action_json_parse_hit_rate'].update(valid_samples / total_samples)
+        self.custom_metrics['train']['opsd_action_json_fallback_rate'].update((total_samples - valid_samples) /
+                                                                              total_samples)
+        self.custom_metrics['train']['opsd_action_mask_token_ratio'].update(
+            total_masked_tokens / total_response_tokens if total_response_tokens > 0 else 0.0)
+        self.custom_metrics['train']['opsd_action_mask_sample_ratio'].update(sum(per_sample_mask_ratio) / total_samples)
+        self.custom_metrics['train']['opsd_action_masked_tokens'].update(float(total_masked_tokens))
+        self.custom_metrics['train']['opsd_action_response_tokens'].update(float(total_response_tokens))
+
     def _accumulate_seen_tokens(self, model_inputs: Dict[str, Any]) -> None:
         attention_mask = model_inputs.get('attention_mask')
         if attention_mask is None:
@@ -321,6 +353,7 @@ class OPSDTrainer(GKDTrainer):
                 response_token_ids = [data.get('response_token_ids', []) for data in generated_inputs]
                 self._update_rollout_metrics(response_token_ids)
                 response_value_masks = self._build_rollout_value_masks(response_token_ids)
+                self._update_action_mask_metrics(response_token_ids, response_value_masks)
                 if response_value_masks is not None:
                     for data, value_mask in zip(generated_inputs, response_value_masks):
                         if value_mask is not None:
@@ -350,6 +383,7 @@ class OPSDTrainer(GKDTrainer):
                     generated_labels, getattr(self.processing_class, 'eos_token_id', None))
                 self._update_rollout_metrics(response_token_ids)
                 response_value_masks = self._build_rollout_value_masks(response_token_ids)
+                self._update_action_mask_metrics(response_token_ids, response_value_masks)
                 generated_inputs = deepcopy(student_source_inputs)
                 for index, (data, token_ids) in enumerate(zip(generated_inputs, response_token_ids)):
                     self._ensure_last_assistant_message(data['messages'])
@@ -429,13 +463,23 @@ class OPSDTrainer(GKDTrainer):
             shifted_teacher_logits = F.pad(shifted_teacher_logits, (0, stu_dim - tea_dim), 'constant', 0)
             shifted_teacher_logits[..., tea_dim:] = shifted_student_logits[..., tea_dim:]
 
-        loss = self.generalized_jsd_loss(
+        jsd_loss = self.generalized_jsd_loss(
             student_logits=shifted_student_logits,
             teacher_logits=shifted_teacher_logits,
             beta=self.beta,
         )
+        loss = jsd_loss
+        mode = 'train' if model.training else 'eval'
+        self.custom_metrics[mode]['jsd_loss'].update(jsd_loss.detach())
         if self.args.sft_alpha > 0:
+            sft_loss = outputs_student.loss.detach()
+            self.custom_metrics[mode]['sft_loss'].update(sft_loss)
+            self.custom_metrics[mode]['sft_loss_weighted'].update((self.args.sft_alpha * sft_loss).detach())
+            weighted_sft = self.args.sft_alpha * sft_loss
+            self.custom_metrics[mode]['jsd_to_sft_ratio'].update(jsd_loss.detach() / sft_loss.clamp_min(1e-12))
+            self.custom_metrics[mode]['jsd_to_weighted_sft_ratio'].update(jsd_loss.detach() / weighted_sft.clamp_min(1e-12))
             loss = loss + self.args.sft_alpha * outputs_student.loss
+        self.custom_metrics[mode]['opsd_total_loss'].update(loss.detach())
 
         if return_outputs:
             return (loss, outputs_student)
