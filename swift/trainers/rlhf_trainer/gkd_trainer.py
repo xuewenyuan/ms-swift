@@ -473,8 +473,6 @@ class GKDTrainer(RolloutTrainerMixin, SwiftMixin, HFGKDTrainer):
         beta=0.5,
         temperature=1.0,
         chunk_size=512,
-        token_clip=None,
-        return_stats=False,
     ):
         # Apply temperature scaling
         student_logits = student_logits / temperature
@@ -493,22 +491,10 @@ class GKDTrainer(RolloutTrainerMixin, SwiftMixin, HFGKDTrainer):
             num_valid = student_logits.size(0)
 
         if num_valid == 0:
-            zero = student_logits.new_zeros(())
-            if return_stats:
-                return zero, {
-                    'num_valid_tokens': 0,
-                    'num_clipped_points': 0,
-                    'num_total_points': 0,
-                    'clip_fraction': zero,
-                    'unclipped_loss': zero,
-                }
-            return zero
+            return student_logits.new_zeros(())
 
         num_valid_int = num_valid if isinstance(num_valid, int) else num_valid.item()
         total_loss = student_logits.new_zeros(())
-        unclipped_total_loss = student_logits.new_zeros(())
-        num_clipped_points = 0
-        num_total_points = 0
 
         # Precompute beta tensor once if needed
         if beta != 0 and beta != 1:
@@ -545,27 +531,10 @@ class GKDTrainer(RolloutTrainerMixin, SwiftMixin, HFGKDTrainer):
                 jsd_chunk = beta_t * kl_teacher + (1 - beta_t) * kl_student
                 del kl_teacher, kl_student
 
-            num_total_points += jsd_chunk.numel()
-            unclipped_total_loss = unclipped_total_loss + jsd_chunk.sum()
-            if token_clip is not None:
-                num_clipped_points += (jsd_chunk > token_clip).sum().item()
-                jsd_chunk = jsd_chunk.clamp(max=token_clip)
             total_loss = total_loss + jsd_chunk.sum()
             del jsd_chunk, s_log_probs, t_log_probs
 
-        loss = total_loss / num_valid
-        if not return_stats:
-            return loss
-
-        unclipped_loss = unclipped_total_loss / num_valid
-        clip_fraction = student_logits.new_tensor(num_clipped_points / max(1, num_total_points))
-        return loss, {
-            'num_valid_tokens': num_valid_int,
-            'num_clipped_points': num_clipped_points,
-            'num_total_points': num_total_points,
-            'clip_fraction': clip_fraction,
-            'unclipped_loss': unclipped_loss,
-        }
+        return total_loss / num_valid
 
     def _prepare_logging(self):
         """Initialize logging components for on-policy rollout tracking."""

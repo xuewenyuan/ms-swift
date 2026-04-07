@@ -280,6 +280,101 @@ class OPSDTrainer(GKDTrainer):
         allowed_keys.update(forward_params)
         return {k: v for k, v in model_inputs.items() if k in allowed_keys}
 
+    @staticmethod
+    def generalized_jsd_loss(
+        student_logits,
+        teacher_logits,
+        labels=None,
+        beta=0.5,
+        temperature=1.0,
+        chunk_size=512,
+        token_clip=None,
+        return_stats=False,
+    ):
+        student_logits = student_logits / temperature
+        teacher_logits = teacher_logits / temperature
+
+        if labels is not None:
+            mask = labels != -100
+            student_logits = student_logits[mask]
+            teacher_logits = teacher_logits[mask]
+            num_valid = mask.sum()
+        else:
+            student_logits = student_logits.view(-1, student_logits.size(-1))
+            teacher_logits = teacher_logits.view(-1, teacher_logits.size(-1))
+            num_valid = student_logits.size(0)
+
+        if num_valid == 0:
+            zero = student_logits.new_zeros(())
+            if return_stats:
+                return zero, {
+                    'num_valid_tokens': 0,
+                    'num_clipped_points': 0,
+                    'num_total_points': 0,
+                    'clip_fraction': zero,
+                    'unclipped_loss': zero,
+                }
+            return zero
+
+        num_valid_int = num_valid if isinstance(num_valid, int) else num_valid.item()
+        total_loss = student_logits.new_zeros(())
+        unclipped_total_loss = student_logits.new_zeros(())
+        num_clipped_points = 0
+        num_total_points = 0
+
+        if beta != 0 and beta != 1:
+            beta_t = torch.tensor(beta, dtype=student_logits.dtype, device=student_logits.device)
+            log_beta = torch.log(beta_t)
+            log_1_minus_beta = torch.log1p(-beta_t)
+        else:
+            beta_t = log_beta = log_1_minus_beta = None
+
+        for start_idx in range(0, num_valid_int, chunk_size):
+            end_idx = min(start_idx + chunk_size, num_valid_int)
+            s_chunk = student_logits[start_idx:end_idx]
+            t_chunk = teacher_logits[start_idx:end_idx]
+
+            s_log_probs = F.log_softmax(s_chunk, dim=-1)
+            t_log_probs = F.log_softmax(t_chunk, dim=-1)
+            del s_chunk, t_chunk
+
+            if beta == 0:
+                jsd_chunk = F.kl_div(s_log_probs, t_log_probs, reduction='none', log_target=True)
+            elif beta == 1:
+                jsd_chunk = F.kl_div(t_log_probs, s_log_probs, reduction='none', log_target=True)
+            else:
+                mixture_log_probs = torch.logsumexp(
+                    torch.stack([s_log_probs + log_1_minus_beta, t_log_probs + log_beta]),
+                    dim=0,
+                )
+                kl_teacher = F.kl_div(mixture_log_probs, t_log_probs, reduction='none', log_target=True)
+                kl_student = F.kl_div(mixture_log_probs, s_log_probs, reduction='none', log_target=True)
+                del mixture_log_probs
+                jsd_chunk = beta_t * kl_teacher + (1 - beta_t) * kl_student
+                del kl_teacher, kl_student
+
+            num_total_points += jsd_chunk.numel()
+            unclipped_total_loss = unclipped_total_loss + jsd_chunk.sum()
+            if token_clip is not None:
+                num_clipped_points += (jsd_chunk > token_clip).sum().item()
+                jsd_chunk = jsd_chunk.clamp(max=token_clip)
+            total_loss = total_loss + jsd_chunk.sum()
+            del jsd_chunk, s_log_probs, t_log_probs
+
+        loss = total_loss / num_valid
+        if not return_stats:
+            return loss
+
+        unclipped_loss = unclipped_total_loss / num_valid
+        clip_fraction = student_logits.new_tensor(num_clipped_points / max(1, num_total_points))
+        return loss, {
+            'num_valid_tokens': num_valid_int,
+            'num_clipped_points': num_clipped_points,
+            'num_total_points': num_total_points,
+            'clip_fraction': clip_fraction,
+            'unclipped_loss': unclipped_loss,
+        }
+
     def _build_student_prompt_inputs(self, source_inputs: DataType, references: List[Optional[str]]) -> DataType:
         student_inputs = deepcopy(source_inputs)
         for data, reference in zip(student_inputs, references):
