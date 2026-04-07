@@ -41,6 +41,9 @@ class OPSDArguments(RLHFArguments):
         self._check_padding_free()
         self._check_opsd()
 
+        if hasattr(self, 'training_args') and self.training_args is not None:
+            self.training_args.jsd_token_clip = self.jsd_token_clip
+
         if self.loss_scale is None:
             self.loss_scale = 'last_round'
         if isinstance(self.ref_adapters, str):
