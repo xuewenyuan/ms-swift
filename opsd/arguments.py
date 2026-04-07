@@ -17,6 +17,7 @@ class OPSDArguments(RLHFArguments):
     opsd_loss_scope: Literal['full', 'action_json_values'] = 'full'
     opsd_action_json_keys: Optional[List[str]] = None
     opsd_action_choices: Optional[List[str]] = None
+    jsd_token_clip: Optional[float] = None
 
     def __post_init__(self):
         self._process_loss_type()
@@ -148,3 +149,5 @@ class OPSDArguments(RLHFArguments):
                              'Please set NPROC_PER_NODE equal to num_processes.')
         if self.multi_turn_scheduler is not None:
             raise NotImplementedError('Currently, multi_turn_scheduler is not supported for OPSD.')
+        if self.jsd_token_clip is not None and self.jsd_token_clip <= 0:
+            raise ValueError('`jsd_token_clip` must be positive when provided.')

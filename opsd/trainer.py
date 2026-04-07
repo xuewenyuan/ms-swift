@@ -463,14 +463,26 @@ class OPSDTrainer(GKDTrainer):
             shifted_teacher_logits = F.pad(shifted_teacher_logits, (0, stu_dim - tea_dim), 'constant', 0)
             shifted_teacher_logits[..., tea_dim:] = shifted_student_logits[..., tea_dim:]
 
-        jsd_loss = self.generalized_jsd_loss(
+        jsd_result = self.generalized_jsd_loss(
             student_logits=shifted_student_logits,
             teacher_logits=shifted_teacher_logits,
             beta=self.beta,
+            token_clip=self.args.jsd_token_clip,
+            return_stats=True,
         )
+        jsd_loss, jsd_stats = jsd_result
         loss = jsd_loss
         mode = 'train' if model.training else 'eval'
         self.custom_metrics[mode]['jsd_loss'].update(jsd_loss.detach())
+        if self.args.jsd_token_clip is not None:
+            self.custom_metrics[mode]['jsd_loss_unclipped'].update(jsd_stats['unclipped_loss'].detach())
+            self.custom_metrics[mode]['jsd_point_clip_fraction'].update(jsd_stats['clip_fraction'].detach())
+            self.custom_metrics[mode]['jsd_point_clip_count'].update(float(jsd_stats['num_clipped_points']))
+            self.custom_metrics[mode]['jsd_point_total_count'].update(float(jsd_stats['num_total_points']))
+            # Backward-compatible aliases for earlier local logging names.
+            self.custom_metrics[mode]['jsd_token_clip_fraction'].update(jsd_stats['clip_fraction'].detach())
+            self.custom_metrics[mode]['jsd_token_clip_count'].update(float(jsd_stats['num_clipped_points']))
+            self.custom_metrics[mode]['jsd_valid_token_count'].update(float(jsd_stats['num_valid_tokens']))
         if self.args.sft_alpha > 0:
             sft_loss = outputs_student.loss.detach()
             self.custom_metrics[mode]['sft_loss'].update(sft_loss)
