@@ -4,6 +4,7 @@
 import json
 import csv
 import argparse
+import math
 from pathlib import Path
 from collections import Counter
 from typing import Dict, Any, List, Optional
@@ -224,6 +225,102 @@ def count_present_keys(record_map: Dict[str, Dict[str, Any]], keys: List[str]) -
     return sum(1 for k in keys if k in record_map)
 
 
+def exact_two_sided_binom_pvalue(k: int, n: int, p: float = 0.5) -> float:
+    if n <= 0:
+        return 1.0
+    tail = sum(math.comb(n, i) * (p**i) * ((1 - p)**(n - i)) for i in range(0, k + 1))
+    return min(1.0, 2.0 * tail)
+
+
+def mcnemar_test_from_discordant(left_only_correct: int, right_only_correct: int) -> Dict[str, Any]:
+    discordant = left_only_correct + right_only_correct
+    if discordant == 0:
+        return {
+            "left_only_correct": left_only_correct,
+            "right_only_correct": right_only_correct,
+            "discordant_total": 0,
+            "exact_pvalue": 1.0,
+            "chi2": 0.0,
+            "chi2_pseudo_stat": 0.0,
+            "winner": "tie",
+            "significant_at_0_05": False,
+        }
+
+    smaller = min(left_only_correct, right_only_correct)
+    exact_pvalue = exact_two_sided_binom_pvalue(smaller, discordant, p=0.5)
+    chi2 = ((abs(left_only_correct - right_only_correct) - 1.0)**2) / discordant
+    if left_only_correct > right_only_correct:
+        winner = "left"
+    elif right_only_correct > left_only_correct:
+        winner = "right"
+    else:
+        winner = "tie"
+    return {
+        "left_only_correct": left_only_correct,
+        "right_only_correct": right_only_correct,
+        "discordant_total": discordant,
+        "exact_pvalue": round(exact_pvalue, 8),
+        "chi2": round(chi2, 8),
+        "chi2_pseudo_stat": round(chi2, 8),
+        "winner": winner,
+        "significant_at_0_05": exact_pvalue < 0.05,
+    }
+
+
+def compare_pairwise_stats(
+    left_map: Dict[str, Dict[str, Any]],
+    right_map: Dict[str, Dict[str, Any]],
+    left_name: str,
+    right_name: str,
+    compare_keys: List[str],
+) -> Dict[str, Any]:
+    left_only_correct = 0
+    right_only_correct = 0
+    both_correct = 0
+    both_wrong = 0
+
+    for k in compare_keys:
+        l_ok = left_map[k]["checker"]
+        r_ok = right_map[k]["checker"]
+        if l_ok and r_ok:
+            both_correct += 1
+        elif l_ok and (not r_ok):
+            left_only_correct += 1
+        elif (not l_ok) and r_ok:
+            right_only_correct += 1
+        else:
+            both_wrong += 1
+
+    stat = mcnemar_test_from_discordant(left_only_correct, right_only_correct)
+    stat.update({
+        "left_name": left_name,
+        "right_name": right_name,
+        "num_common": len(compare_keys),
+        "both_correct": both_correct,
+        "both_wrong": both_wrong,
+        "left_accuracy": round(safe_div(left_only_correct + both_correct, len(compare_keys)), 6),
+        "right_accuracy": round(safe_div(right_only_correct + both_correct, len(compare_keys)), 6),
+        "accuracy_delta_right_minus_left": round(
+            safe_div(right_only_correct - left_only_correct, len(compare_keys)), 6),
+    })
+    return stat
+
+
+REFERENCE_BUCKET_LABELS = {
+    "base错_ref对_target对": "initial model 在 reference-free 下错、在 reference-based 下对，且 target 也修复成功",
+    "base错_ref错_target对": "initial model 在 reference-free/reference-based 下都错，但 target 修复成功",
+    "base错_ref缺失_target对": "initial model 在 reference-free 下错，base_ref 缺失，且 target 修复成功",
+    "base对_ref对_target错": "initial model 在 reference-free/reference-based 下都对，但 target 退化为错",
+    "base对_ref错_target错": "initial model 在 reference-free 下对、在 reference-based 下反而错，且 target 也错",
+    "base对_ref缺失_target错": "initial model 在 reference-free 下对，base_ref 缺失，且 target 错",
+}
+
+
+def format_reference_bucket_line(bucket_name: str, count: int, ratio: float) -> str:
+    desc = REFERENCE_BUCKET_LABELS.get(bucket_name, bucket_name)
+    return f"- {bucket_name}: {count} ({ratio:.6f})\n  含义：{desc}"
+
+
 def merged_row_from_models(
     frame_key: str,
     model_to_record: Dict[str, Optional[Dict[str, Any]]]
@@ -426,6 +523,124 @@ def compare_target_vs_base(
     return out
 
 
+def analyze_reference_helpfulness_on_main_set(
+    base_va_map: Dict[str, Dict[str, Any]],
+    base_ref_map: Dict[str, Dict[str, Any]],
+    sft_map: Dict[str, Dict[str, Any]],
+    opsd_map: Dict[str, Dict[str, Any]],
+    compare_keys: List[str],
+) -> Dict[str, Any]:
+    covered_keys = [k for k in compare_keys if k in base_ref_map]
+
+    buckets = {
+        "ref_helpful_base_wrong_ref_right": [],
+        "both_correct": [],
+        "ref_harmful_base_right_ref_wrong": [],
+        "both_wrong": [],
+    }
+
+    for k in covered_keys:
+        b_ok = base_va_map[k]["checker"]
+        r_ok = base_ref_map[k]["checker"]
+        if (not b_ok) and r_ok:
+            buckets["ref_helpful_base_wrong_ref_right"].append(k)
+        elif b_ok and r_ok:
+            buckets["both_correct"].append(k)
+        elif b_ok and (not r_ok):
+            buckets["ref_harmful_base_right_ref_wrong"].append(k)
+        else:
+            buckets["both_wrong"].append(k)
+
+    bucket_ratios = {
+        bucket_name: round(safe_div(len(keys), len(covered_keys)), 6)
+        for bucket_name, keys in buckets.items()
+    }
+
+    per_bucket = {}
+    model_maps = {
+        "base_va": base_va_map,
+        "base_ref": base_ref_map,
+        "sft_va": sft_map,
+        "opsd_va": opsd_map,
+    }
+
+    for bucket_name, keys in buckets.items():
+        bucket_info = {
+            "count": len(keys),
+            "ratio_on_base_ref_covered_main_set": round(safe_div(len(keys), len(covered_keys)), 6),
+            "accuracies": {
+                model_name: subset_accuracy_from_keys(model_map, keys)
+                for model_name, model_map in model_maps.items()
+            },
+            "sft_vs_base_va": compare_target_vs_base(
+                base_map=base_va_map,
+                target_map=sft_map,
+                base_name="base_va",
+                target_name="sft_va",
+                compare_keys=keys,
+            ),
+            "opsd_vs_base_va": compare_target_vs_base(
+                base_map=base_va_map,
+                target_map=opsd_map,
+                base_name="base_va",
+                target_name="opsd_va",
+                compare_keys=keys,
+            ),
+            "opsd_vs_sft": compare_pairwise_four_buckets(
+                left_map=opsd_map,
+                right_map=sft_map,
+                left_name="opsd_va",
+                right_name="sft_va",
+                compare_keys=keys,
+            ),
+        }
+
+        base_wrong_keys = [k for k in keys if not base_va_map[k]["checker"]]
+        bucket_info["repair_on_base_wrong_subset"] = {
+            "base_wrong_count": len(base_wrong_keys),
+            "sft_repaired": sum(1 for k in base_wrong_keys if sft_map[k]["checker"]),
+            "opsd_repaired": sum(1 for k in base_wrong_keys if opsd_map[k]["checker"]),
+            "sft_repair_rate": round(
+                safe_div(sum(1 for k in base_wrong_keys if sft_map[k]["checker"]), len(base_wrong_keys)), 6),
+            "opsd_repair_rate": round(
+                safe_div(sum(1 for k in base_wrong_keys if opsd_map[k]["checker"]), len(base_wrong_keys)), 6),
+        }
+        bucket_info["paired_stats"] = {
+            "sft_vs_base_va": compare_pairwise_stats(
+                left_map=base_va_map,
+                right_map=sft_map,
+                left_name="base_va",
+                right_name="sft_va",
+                compare_keys=keys,
+            ),
+            "opsd_vs_base_va": compare_pairwise_stats(
+                left_map=base_va_map,
+                right_map=opsd_map,
+                left_name="base_va",
+                right_name="opsd_va",
+                compare_keys=keys,
+            ),
+            "opsd_vs_sft": compare_pairwise_stats(
+                left_map=sft_map,
+                right_map=opsd_map,
+                left_name="sft_va",
+                right_name="opsd_va",
+                compare_keys=keys,
+            ),
+        }
+        per_bucket[bucket_name] = bucket_info
+
+    return {
+        "num_main_3way_keys": len(compare_keys),
+        "num_base_ref_covered_keys": len(covered_keys),
+        "base_ref_coverage_ratio_on_main_3way": round(safe_div(len(covered_keys), len(compare_keys)), 6),
+        "bucket_counts": {bucket_name: len(keys) for bucket_name, keys in buckets.items()},
+        "bucket_ratios": bucket_ratios,
+        "bucket_keys": buckets,
+        "per_bucket": per_bucket,
+    }
+
+
 def save_pairwise_bucket_details(
     out_dir: Path,
     cmp_res: Dict[str, Any],
@@ -506,10 +721,60 @@ def format_acc_line(name: str, acc_obj: Dict[str, Any]) -> str:
     return f"- {name}: correct={acc_obj['correct']}, total={acc_obj['total']}, acc={acc_obj['accuracy']:.6f}"
 
 
+def format_stat_test_line(stat: Dict[str, Any]) -> str:
+    winner_map = {
+        "left": stat["left_name"],
+        "right": stat["right_name"],
+        "tie": "tie",
+    }
+    return (
+        f"- {stat['left_name']} vs {stat['right_name']}: "
+        f"delta({stat['right_name']}-{stat['left_name']})={stat['accuracy_delta_right_minus_left']:.6f}, "
+        f"discordant={stat['discordant_total']}, "
+        f"exact_p={stat['exact_pvalue']:.8f}, "
+        f"winner={winner_map[stat['winner']]}, "
+        f"significant={stat['significant_at_0_05']}"
+    )
+
+
+def summarize_stat_conclusion(stat: Dict[str, Any]) -> str:
+    left_name = stat["left_name"]
+    right_name = stat["right_name"]
+    delta = stat["accuracy_delta_right_minus_left"]
+    pvalue = stat["exact_pvalue"]
+    significant = stat["significant_at_0_05"]
+    winner = stat["winner"]
+    discordant = stat["discordant_total"]
+
+    if discordant == 0:
+        return f"{left_name} 与 {right_name} 在公共样本上没有分歧样本，当前无法区分优劣。"
+
+    if winner == "tie" or abs(delta) < 1e-12:
+        if significant:
+            return f"{left_name} 与 {right_name} 差异接近于 0，但统计结果异常地显示显著，建议复核数据。"
+        return f"{left_name} 与 {right_name} 在公共样本上的差异不明显，未观察到统计显著差异。"
+
+    better = right_name if winner == "right" else left_name
+    worse = left_name if winner == "right" else right_name
+    if significant:
+        return (f"{better} 相比 {worse} 表现更好，且差异达到统计显著 "
+                f"(McNemar exact p={pvalue:.8f})。")
+    return (f"{better} 相比 {worse} 看起来更好，但差异尚未达到统计显著 "
+            f"(McNemar exact p={pvalue:.8f})。")
+
+
 def write_report_md(path: Path, summary: Dict[str, Any]):
     lines = []
 
     lines.append("# 模型评测对比报告\n")
+
+    lines.append("## 0. 实验定义\n")
+    lines.append("- `base model`：训练 OPSD 和 SFT 时共同使用的 initial model。")
+    lines.append("- `base_va`：base model 在 reference-free 条件下的推理结果。")
+    lines.append("- `base_ref`：base model 在 reference-based 条件下的推理结果。")
+    lines.append("- `sft_va` / `opsd_va`：SFT / OPSD 训练后模型在 reference-free 条件下的推理结果。")
+    lines.append("- 统计检验使用 paired McNemar exact test，仅在公共 frame 集上进行。")
+    lines.append("")
 
     lines.append("## 1. 各模型准确率\n")
     lines.append("### 1.1 Clip 级准确率（各自全量）")
@@ -537,14 +802,42 @@ def write_report_md(path: Path, summary: Dict[str, Any]):
         lines.append(format_acc_line(model_name, v))
     lines.append("")
 
-    lines.append("## 2. base model: va vs reference-prompt（frame级）\n")
+    lines.append("## 2. initial model：reference-free vs reference-based（frame级）\n")
     base_ref = summary["comparisons"]["base_va_vs_base_ref"]
     lines.append(f"- common frames: {base_ref['num_common']}")
     for k, v in base_ref["counts"].items():
         lines.append(f"- {k}: {v} ({base_ref['ratios_on_common'][k]:.6f})")
     lines.append("")
 
-    lines.append("## 3. sft va 相较于 base va（frame级）\n")
+    ref_help = summary["reference_helpfulness_main_3way"]
+    lines.append("## 3. 在主结论样本集上，reference 对 initial model 的帮助分布\n")
+    lines.append(f"- main 3-way frames: {ref_help['num_main_3way_keys']}")
+    lines.append(f"- base_ref covered frames: {ref_help['num_base_ref_covered_keys']} "
+                 f"({ref_help['base_ref_coverage_ratio_on_main_3way']:.6f})")
+    for bucket_name, count in ref_help["bucket_counts"].items():
+        lines.append(f"- {bucket_name}: {count} ({ref_help['bucket_ratios'][bucket_name]:.6f})")
+    lines.append("")
+
+    key_bucket = "ref_helpful_base_wrong_ref_right"
+    if key_bucket in ref_help["per_bucket"]:
+        key_bucket_info = ref_help["per_bucket"][key_bucket]
+        lines.append("### 3.1 reference-helpful 子集上的修复能力")
+        for model_name, acc_obj in key_bucket_info["accuracies"].items():
+            lines.append(format_acc_line(model_name, acc_obj))
+        repair = key_bucket_info["repair_on_base_wrong_subset"]
+        lines.append(f"- sft repair: {repair['sft_repaired']}/{repair['base_wrong_count']} "
+                     f"({repair['sft_repair_rate']:.6f})")
+        lines.append(f"- opsd repair: {repair['opsd_repaired']}/{repair['base_wrong_count']} "
+                     f"({repair['opsd_repair_rate']:.6f})")
+        lines.append("")
+
+        lines.append("### 3.2 reference-helpful 子集上的统计检验")
+        for stat in key_bucket_info["paired_stats"].values():
+            lines.append(format_stat_test_line(stat))
+            lines.append(f"  结论：{summarize_stat_conclusion(stat)}")
+        lines.append("")
+
+    lines.append("## 4. sft va 相较于 base va（frame级）\n")
     sft_cmp = summary["comparisons"]["sft_vs_base_va"]
     lines.append(f"- common frames (main 3-way set): {sft_cmp['num_common']}")
     for k, v in sft_cmp["counts"].items():
@@ -555,20 +848,20 @@ def write_report_md(path: Path, summary: Dict[str, Any]):
     lines.append("")
 
     if "improved_by_reference_bucket" in sft_cmp["breakdown"]:
-        lines.append("### 3.1 SFT 提升属于哪一部分（结合 base reference）")
+        lines.append("### 4.1 在 SFT 相比 initial model 新增修复的样本中，base_ref 属于哪一类")
         total = sum(sft_cmp["breakdown"]["improved_by_reference_bucket"].values())
         for k, v in sorted_items_desc(sft_cmp["breakdown"]["improved_by_reference_bucket"]):
-            lines.append(f"- {k}: {v} ({safe_div(v, total):.6f})")
+            lines.append(format_reference_bucket_line(k, v, safe_div(v, total)))
         lines.append("")
 
     if "regressed_by_reference_bucket" in sft_cmp["breakdown"]:
-        lines.append("### 3.2 SFT 退化属于哪一部分（结合 base reference）")
+        lines.append("### 4.2 在 SFT 相比 initial model 新增退化的样本中，base_ref 属于哪一类")
         total = sum(sft_cmp["breakdown"]["regressed_by_reference_bucket"].values())
         for k, v in sorted_items_desc(sft_cmp["breakdown"]["regressed_by_reference_bucket"]):
-            lines.append(f"- {k}: {v} ({safe_div(v, total):.6f})")
+            lines.append(format_reference_bucket_line(k, v, safe_div(v, total)))
         lines.append("")
 
-    lines.append("## 4. opsd va 相较于 base va（frame级）\n")
+    lines.append("## 5. opsd va 相较于 base va（frame级）\n")
     opsd_cmp = summary["comparisons"]["opsd_vs_base_va"]
     lines.append(f"- common frames (main 3-way set): {opsd_cmp['num_common']}")
     for k, v in opsd_cmp["counts"].items():
@@ -579,32 +872,39 @@ def write_report_md(path: Path, summary: Dict[str, Any]):
     lines.append("")
 
     if "improved_by_reference_bucket" in opsd_cmp["breakdown"]:
-        lines.append("### 4.1 OPSD 提升属于哪一部分（结合 base reference）")
+        lines.append("### 5.1 在 OPSD 相比 initial model 新增修复的样本中，base_ref 属于哪一类")
         total = sum(opsd_cmp["breakdown"]["improved_by_reference_bucket"].values())
         for k, v in sorted_items_desc(opsd_cmp["breakdown"]["improved_by_reference_bucket"]):
-            lines.append(f"- {k}: {v} ({safe_div(v, total):.6f})")
+            lines.append(format_reference_bucket_line(k, v, safe_div(v, total)))
         lines.append("")
 
     if "regressed_by_reference_bucket" in opsd_cmp["breakdown"]:
-        lines.append("### 4.2 OPSD 退化属于哪一部分（结合 base reference）")
+        lines.append("### 5.2 在 OPSD 相比 initial model 新增退化的样本中，base_ref 属于哪一类")
         total = sum(opsd_cmp["breakdown"]["regressed_by_reference_bucket"].values())
         for k, v in sorted_items_desc(opsd_cmp["breakdown"]["regressed_by_reference_bucket"]):
-            lines.append(f"- {k}: {v} ({safe_div(v, total):.6f})")
+            lines.append(format_reference_bucket_line(k, v, safe_div(v, total)))
         lines.append("")
 
-    lines.append("## 5. opsd va vs sft va（frame级）\n")
+    lines.append("## 6. opsd va vs sft va（frame级）\n")
     opsd_sft = summary["comparisons"]["opsd_vs_sft"]
     lines.append(f"- common frames (main 3-way set): {opsd_sft['num_common']}")
     for k, v in opsd_sft["counts"].items():
         lines.append(f"- {k}: {v} ({opsd_sft['ratios_on_common'][k]:.6f})")
     lines.append("")
 
-    lines.append("## 6. 主结论口径\n")
+    lines.append("## 7. 主结论口径\n")
     lines.append("- 下述 base/sft/opsd 对比与结论仅基于 base_va、opsd_va、sft_va 三者公共 frame 集。")
     lines.append("- base_ref 只用于 reference 对比与分桶分析，不参与主结论样本集定义。")
+    lines.append("- 如果要判断 OPSD 是否学到了 reference 带来的增益，应优先看 `ref_helpful_base_wrong_ref_right` 子集。")
     lines.append("")
 
-    lines.append("## 7. 对齐信息\n")
+    lines.append("## 8. 统计检验（主结论样本集）\n")
+    for stat in summary["statistical_tests"]["main_3way"].values():
+        lines.append(format_stat_test_line(stat))
+        lines.append(f"  结论：{summarize_stat_conclusion(stat)}")
+    lines.append("")
+
+    lines.append("## 9. 对齐信息\n")
     for k, v in summary["alignment"].items():
         lines.append(f"- {k}: {v}")
     lines.append("")
@@ -762,6 +1062,40 @@ def main():
         "sft_va",
     )
 
+    reference_helpfulness_main_3way = analyze_reference_helpfulness_on_main_set(
+        base_va_map=frame_maps["base_va"],
+        base_ref_map=frame_maps["base_ref"],
+        sft_map=frame_maps["sft_va"],
+        opsd_map=frame_maps["opsd_va"],
+        compare_keys=common_frame_keys_3way_main,
+    )
+
+    statistical_tests = {
+        "main_3way": {
+            "sft_vs_base_va": compare_pairwise_stats(
+                left_map=frame_maps["base_va"],
+                right_map=frame_maps["sft_va"],
+                left_name="base_va",
+                right_name="sft_va",
+                compare_keys=common_frame_keys_3way_main,
+            ),
+            "opsd_vs_base_va": compare_pairwise_stats(
+                left_map=frame_maps["base_va"],
+                right_map=frame_maps["opsd_va"],
+                left_name="base_va",
+                right_name="opsd_va",
+                compare_keys=common_frame_keys_3way_main,
+            ),
+            "opsd_vs_sft": compare_pairwise_stats(
+                left_map=frame_maps["sft_va"],
+                right_map=frame_maps["opsd_va"],
+                left_name="sft_va",
+                right_name="opsd_va",
+                compare_keys=common_frame_keys_3way_main,
+            ),
+        }
+    }
+
     summary = {
         "inputs": model_files,
         "alignment": alignment_info,
@@ -777,7 +1111,9 @@ def main():
             "sft_vs_base_va": cmp_sft_base,
             "opsd_vs_base_va": cmp_opsd_base,
             "opsd_vs_sft": cmp_opsd_sft,
-        }
+        },
+        "statistical_tests": statistical_tests,
+        "reference_helpfulness_main_3way": reference_helpfulness_main_3way,
     }
 
     write_json(output_dir / "summary.json", summary)
@@ -821,6 +1157,25 @@ def main():
     print("\n====== opsd_va vs sft_va ======")
     for k, v in cmp_opsd_sft["counts"].items():
         print(f"{k:30s}: {v}")
+
+    print("\n====== statistical tests on main 3-way set ======")
+    for stat in statistical_tests["main_3way"].values():
+        print(format_stat_test_line(stat))
+        print(f"  结论：{summarize_stat_conclusion(stat)}")
+
+    print("\n====== reference_helpful subset on main 3-way set ======")
+    ref_helpful_bucket = reference_helpfulness_main_3way["per_bucket"].get("ref_helpful_base_wrong_ref_right", {})
+    repair = ref_helpful_bucket.get("repair_on_base_wrong_subset", {})
+    if repair:
+        print(f"{'base_wrong_count':30s}: {repair['base_wrong_count']}")
+        print(f"{'sft_repaired':30s}: {repair['sft_repaired']} ({repair['sft_repair_rate']:.6f})")
+        print(f"{'opsd_repaired':30s}: {repair['opsd_repaired']} ({repair['opsd_repair_rate']:.6f})")
+    paired_stats = ref_helpful_bucket.get("paired_stats", {})
+    if paired_stats:
+        print("\n====== statistical tests on reference_helpful subset ======")
+        for stat in paired_stats.values():
+            print(format_stat_test_line(stat))
+            print(f"  结论：{summarize_stat_conclusion(stat)}")
 
 
 if __name__ == "__main__":
