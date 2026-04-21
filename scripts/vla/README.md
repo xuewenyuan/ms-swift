@@ -4,6 +4,9 @@
 `--input` accepts either one `.jsonl` file or a directory. For directory input,
 the script recursively finds all `*.jsonl` files and processes them in sorted
 path order.
+By default, `input_text_hash.npy` is built from the ego-state segment between
+`自车当前状态信息有：` and `自车的驾驶决策包括`, instead of the full prompt. Use
+`--input-text-scope full` to restore full-prompt text features.
 
 ## FAISS-friendly dump
 

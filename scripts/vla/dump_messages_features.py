@@ -23,6 +23,8 @@ MEDIA_TAG_RE = re.compile(r"<(image|video|audio)>")
 SPECIAL_TOKEN_RE = re.compile(r"<[^<>\s]+>")
 LOC_TOKEN_RE = re.compile(r"<LOC_(\d+)>")
 POINT_TOKEN_RE = re.compile(r"<P_(\d+)>")
+EGO_STATE_START_MARKERS = ("自车当前状态信息有：", "自车当前状态信息有:")
+EGO_STATE_END_MARKERS = ("自车的驾驶决策包括",)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -43,6 +45,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Shard rows by global row_idx %% WORLD_SIZE == RANK and write one dump per rank.")
     parser.add_argument("--model", default=None, help="Optional model id/path for tokenizer ids only.")
     parser.add_argument("--sample-id-key", default="sample_id", help="Preferred sample id key.")
+    parser.add_argument(
+        "--input-text-scope",
+        choices=["ego_state", "full"],
+        default="ego_state",
+        help="Text span used for input_text_hash. Default: ego_state, the segment between ego-state and decision markers.")
     parser.add_argument("--text-hash-dim", type=int, default=256, help="Dimension for hashed input text vector.")
     parser.add_argument("--decision-hash-dim", type=int, default=64, help="Dimension for hashed decision token vector.")
     parser.add_argument("--max-traj-points", type=int, default=10, help="Max trajectory points kept in dense arrays.")
@@ -86,7 +93,14 @@ def main() -> None:
             seen += 1
             if args.distributed and row_idx % world_size != rank:
                 continue
-            feature = build_feature(row, row_idx, args.sample_id_key, tokenizer, args.keep_text, args.keep_token_ids)
+            feature = build_feature(
+                row,
+                row_idx,
+                args.sample_id_key,
+                tokenizer,
+                args.keep_text,
+                args.keep_token_ids,
+                args.input_text_scope)
             if legacy_f is not None:
                 legacy_f.write(json.dumps(feature, ensure_ascii=False, separators=(",", ":")) + "\n")
             if writer is not None:
@@ -236,6 +250,9 @@ def make_meta_row(feature: Dict[str, Any]) -> Dict[str, Any]:
         "channel": feature.get("channel"),
         "input": {
             "sha1": feature["input"]["sha1"],
+            "full_sha1": feature["input"].get("full_sha1"),
+            "text_scope": feature["input"].get("text_scope"),
+            "text_scope_found": feature["input"].get("text_scope_found"),
             "char_len": feature["input"]["char_len"],
             "token_len": feature["input"]["token_len"],
             "media_tags": feature["input"]["media_tags"],
@@ -318,7 +335,8 @@ def build_feature(
         sample_id_key: str,
         tokenizer: Any = None,
         keep_text: bool = False,
-        keep_token_ids: bool = False) -> Dict[str, Any]:
+        keep_token_ids: bool = False,
+        input_text_scope: str = "ego_state") -> Dict[str, Any]:
     messages = row.get("messages")
     if isinstance(messages, str):
         messages = json.loads(messages)
@@ -326,13 +344,14 @@ def build_feature(
         raise ValueError(f"row {row_idx}: missing non-empty messages")
 
     input_messages, output_messages = split_input_output(messages)
-    input_text = "\n".join(str(m.get("content", "")) for m in input_messages)
+    full_input_text = "\n".join(str(m.get("content", "")) for m in input_messages)
+    input_text, input_scope_found = select_input_feature_text(full_input_text, input_text_scope)
     output_text = "\n".join(str(m.get("content", "")) for m in output_messages)
 
     input_ids = encode(tokenizer, input_text)
     output_ids = encode(tokenizer, output_text)
     parsed_output = parse_vla_output(output_text)
-    media = extract_media(row, input_text)
+    media = extract_media(row, full_input_text)
 
     feature = {
         "sample_id": str(row.get(sample_id_key) or row.get("id") or f"row_{row_idx:08d}"),
@@ -340,9 +359,12 @@ def build_feature(
         "channel": row.get("channel"),
         "input": {
             "sha1": sha1(input_text),
+            "full_sha1": sha1(full_input_text),
+            "text_scope": input_text_scope,
+            "text_scope_found": input_scope_found,
             "char_len": len(input_text),
             "token_len": len(input_ids) if input_ids is not None else None,
-            "media_tags": count_media_tags(input_text),
+            "media_tags": count_media_tags(full_input_text),
             "text_ngram_hashes": ngram_hashes(input_text),
         },
         "media": media,
@@ -356,6 +378,8 @@ def build_feature(
     }
     if keep_text:
         feature["input"]["text"] = input_text
+        if input_text != full_input_text:
+            feature["input"]["full_text"] = full_input_text
         feature["output"]["text"] = output_text
     if keep_token_ids:
         if input_ids is not None:
@@ -373,6 +397,37 @@ def split_input_output(messages: Sequence[Dict[str, Any]]) -> Tuple[List[Dict[st
     if last_assistant is None:
         return list(messages), []
     return list(messages[:last_assistant]), list(messages[last_assistant:])
+
+
+def select_input_feature_text(text: str, scope: str) -> Tuple[str, bool]:
+    if scope == "full":
+        return text, True
+    if scope != "ego_state":
+        raise ValueError(f"unsupported input_text_scope: {scope}")
+    ego_state = extract_between_markers(text, EGO_STATE_START_MARKERS, EGO_STATE_END_MARKERS)
+    if ego_state is None:
+        return text, False
+    return ego_state, True
+
+
+def extract_between_markers(text: str, start_markers: Sequence[str], end_markers: Sequence[str]) -> Optional[str]:
+    start_pos = -1
+    start_len = 0
+    for marker in start_markers:
+        pos = text.find(marker)
+        if pos >= 0 and (start_pos < 0 or pos < start_pos):
+            start_pos = pos
+            start_len = len(marker)
+    if start_pos < 0:
+        return None
+
+    content_start = start_pos + start_len
+    end_pos = len(text)
+    for marker in end_markers:
+        pos = text.find(marker, content_start)
+        if pos >= 0 and pos < end_pos:
+            end_pos = pos
+    return text[content_start:end_pos].strip()
 
 
 def parse_vla_output(text: str) -> Dict[str, Any]:
