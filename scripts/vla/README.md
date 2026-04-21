@@ -77,6 +77,16 @@ python3 scripts/vla/cluster_features_faiss.py \
   --matrix curation_fused
 ```
 
+To run FAISS k-means on specific GPUs:
+
+```shell
+python3 scripts/vla/cluster_features_faiss.py \
+  --input-dir /path/to/feature_dump \
+  --output-dir /path/to/feature_dump_cluster_report \
+  --matrix input_text_hash \
+  --gpu-devices 0,1,2,3
+```
+
 The output directory contains:
 
 ```text

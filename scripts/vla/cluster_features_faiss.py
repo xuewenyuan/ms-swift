@@ -35,6 +35,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=42, help="Random seed. Default: 42.")
     parser.add_argument("--gpu", action="store_true", help="Use FAISS GPU resources when available.")
     parser.add_argument(
+        "--gpu-devices",
+        default=None,
+        help="Comma-separated GPU ids for FAISS k-means, for example: 0,1,2,3. Implies --gpu.")
+    parser.add_argument(
         "--max-points-per-centroid",
         type=int,
         default=256,
@@ -85,6 +89,7 @@ def main() -> None:
         nredo=args.nredo,
         seed=args.seed,
         gpu=args.gpu,
+        gpu_devices=parse_gpu_devices(args.gpu_devices),
         max_points_per_centroid=args.max_points_per_centroid,
     )
 
@@ -118,6 +123,26 @@ def import_faiss():
         raise ModuleNotFoundError(
             "faiss is required. Please install faiss-cpu or faiss-gpu in this environment.") from e
     return faiss
+
+
+def parse_gpu_devices(value: Optional[str]) -> Optional[List[int]]:
+    if value is None or value.strip() == "":
+        return None
+    devices = []
+    for item in value.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        try:
+            device = int(item)
+        except ValueError as e:
+            raise ValueError(f"invalid gpu device id: {item}") from e
+        if device < 0:
+            raise ValueError(f"gpu device id must be non-negative: {device}")
+        devices.append(device)
+    if not devices:
+        raise ValueError("--gpu-devices did not contain any valid device ids")
+    return devices
 
 
 def load_dump(input_dir: Path, matrix_arg: str) -> Dict[str, Any]:
@@ -175,17 +200,21 @@ def run_faiss_kmeans(
         nredo: int,
         seed: int,
         gpu: bool,
+        gpu_devices: Optional[Sequence[int]],
         max_points_per_centroid: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     kwargs = {
         "niter": niter,
         "nredo": nredo,
         "verbose": True,
         "seed": seed,
-        "gpu": gpu,
+        "gpu": gpu and not gpu_devices,
         "max_points_per_centroid": max_points_per_centroid,
         "spherical": metric == "cosine",
     }
     kmeans = faiss.Kmeans(x.shape[1], k, **kwargs)
+    if gpu_devices:
+        kmeans.index, gpu_resources = make_gpu_index(faiss, x.shape[1], metric, gpu_devices)
+        kmeans._gpu_resources = gpu_resources
     kmeans.train(x)
     centroids = np.ascontiguousarray(kmeans.centroids.astype(np.float32))
     if metric == "cosine":
@@ -199,6 +228,22 @@ def run_faiss_kmeans(
     scores = scores.reshape(-1).astype(np.float32)
     closeness = scores if metric == "cosine" else -scores
     return ids, closeness, centroids
+
+
+def make_gpu_index(faiss: Any, dim: int, metric: str, gpu_devices: Sequence[int]) -> Tuple[Any, List[Any]]:
+    if not hasattr(faiss, "StandardGpuResources"):
+        raise RuntimeError("The installed faiss package does not expose GPU resources. Please install faiss-gpu.")
+    if not hasattr(faiss, "index_cpu_to_gpu_multiple_py"):
+        raise RuntimeError("The installed faiss package does not support multi-GPU index cloning.")
+    resources = []
+    for _ in gpu_devices:
+        resource = faiss.StandardGpuResources()
+        if hasattr(resource, "setDefaultNullStreamAllDevices"):
+            resource.setDefaultNullStreamAllDevices()
+        resources.append(resource)
+    cpu_index = faiss.IndexFlatIP(dim) if metric == "cosine" else faiss.IndexFlatL2(dim)
+    gpu_index = faiss.index_cpu_to_gpu_multiple_py(resources, cpu_index, gpus=[int(device) for device in gpu_devices])
+    return gpu_index, resources
 
 
 def build_summary(
