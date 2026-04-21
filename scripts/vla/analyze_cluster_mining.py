@@ -20,6 +20,8 @@ class MetaInfo(NamedTuple):
     sample_id: str
     row_idx: Optional[int]
     scene_id: str
+    sample_token: Optional[str]
+    timestamp: Any
     primary_scene: str
     secondary_scene: str
 
@@ -63,6 +65,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional original JSONL file/dir. Used to recover scene_id when old meta.jsonl does not contain it.")
     parser.add_argument("--sample-id-key", default="sample_id", help="Sample id key in raw JSONL.")
     parser.add_argument("--scene-id-key", default="scene_id", help="Scene id key in raw JSONL.")
+    parser.add_argument("--sample-token-key", default="sample_token", help="Sample token key in raw JSONL.")
+    parser.add_argument("--timestamp-key", default="timestamp", help="Timestamp key in raw JSONL.")
     parser.add_argument("--primary-scene-key", default="专题", help="Primary scene label key in --scene-map.")
     parser.add_argument("--secondary-scene-key", default="二级场景", help="Secondary scene label key in --scene-map.")
     parser.add_argument("--topn", type=int, default=20, help="Top rows/items in markdown summaries. Default: 20.")
@@ -135,11 +139,16 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     scene_map = read_json(Path(args.scene_map))
-    raw_scene_lookup = load_raw_scene_lookup(args.raw_input, args.sample_id_key, args.scene_id_key)
+    raw_meta_lookup = load_raw_meta_lookup(
+        args.raw_input,
+        args.sample_id_key,
+        args.scene_id_key,
+        args.sample_token_key,
+        args.timestamp_key)
     meta_rows = load_feature_meta(
         Path(args.feature_dir),
         scene_map,
-        raw_scene_lookup,
+        raw_meta_lookup,
         primary_key=args.primary_scene_key,
         secondary_key=args.secondary_scene_key,
     )
@@ -180,25 +189,34 @@ def main() -> None:
 def load_feature_meta(
         feature_dir: Path,
         scene_map: Dict[str, Any],
-        raw_scene_lookup: Tuple[Dict[str, str], Dict[int, str]],
+        raw_meta_lookup: Tuple[Dict[str, Dict[str, Any]], Dict[int, Dict[str, Any]]],
         *,
         primary_key: str,
         secondary_key: str) -> List[MetaInfo]:
     rows: List[Tuple[int, MetaInfo]] = []
-    sample_to_scene, row_to_scene = raw_scene_lookup
+    sample_to_meta, row_to_meta = raw_meta_lookup
     for meta_path in resolve_meta_files(feature_dir):
         for local_idx, meta in enumerate(iter_jsonl(meta_path)):
             row_idx = to_optional_int(meta.get("row_idx"))
             sample_id = str(meta.get("sample_id") or f"row_{len(rows):08d}")
+            raw_meta = sample_to_meta.get(sample_id) or (row_to_meta.get(row_idx) if row_idx is not None else {}) or {}
             scene_id = scene_id_from_meta(meta)
             if not scene_id:
-                scene_id = sample_to_scene.get(sample_id) or (row_to_scene.get(row_idx) if row_idx is not None else None)
+                scene_id = raw_meta.get("scene_id")
             scene_id = str(scene_id or "")
+            sample_token = meta.get("sample_token")
+            if sample_token in (None, ""):
+                sample_token = raw_meta.get("sample_token")
+            sample_token = str(sample_token) if sample_token not in (None, "") else None
+            timestamp = meta.get("timestamp")
+            if timestamp in (None, ""):
+                timestamp = raw_meta.get("timestamp")
             labels = scene_map.get(scene_id) if scene_id else None
             primary = scene_label(labels, primary_key)
             secondary = scene_label(labels, secondary_key)
             sort_key = row_idx if row_idx is not None else len(rows)
-            rows.append((sort_key, MetaInfo(sample_id, row_idx, scene_id or UNKNOWN, primary, secondary)))
+            rows.append((sort_key, MetaInfo(sample_id, row_idx, scene_id or UNKNOWN, sample_token, timestamp, primary,
+                                            secondary)))
     rows.sort(key=lambda item: item[0])
     return [item[1] for item in rows]
 
@@ -215,24 +233,27 @@ def resolve_meta_files(feature_dir: Path) -> List[Path]:
     return [meta_path]
 
 
-def load_raw_scene_lookup(
+def load_raw_meta_lookup(
         raw_input: Optional[str],
         sample_id_key: str,
-        scene_id_key: str) -> Tuple[Dict[str, str], Dict[int, str]]:
+        scene_id_key: str,
+        sample_token_key: str,
+        timestamp_key: str) -> Tuple[Dict[str, Dict[str, Any]], Dict[int, Dict[str, Any]]]:
     if not raw_input:
         return {}, {}
-    sample_to_scene: Dict[str, str] = {}
-    row_to_scene: Dict[int, str] = {}
+    sample_to_meta: Dict[str, Dict[str, Any]] = {}
+    row_to_meta: Dict[int, Dict[str, Any]] = {}
     for row_idx, row in enumerate(iter_jsonl_files(resolve_input_files(Path(raw_input)))):
-        scene_id = row.get(scene_id_key)
-        if scene_id is None:
-            continue
-        scene_id = str(scene_id)
-        row_to_scene[row_idx] = scene_id
+        raw_meta = {
+            "scene_id": str(row.get(scene_id_key)) if row.get(scene_id_key) not in (None, "") else None,
+            "sample_token": str(row.get(sample_token_key)) if row.get(sample_token_key) not in (None, "") else None,
+            "timestamp": row.get(timestamp_key),
+        }
+        row_to_meta[row_idx] = raw_meta
         sample_id = row.get(sample_id_key) or row.get("id")
         if sample_id is not None:
-            sample_to_scene[str(sample_id)] = scene_id
-    return sample_to_scene, row_to_scene
+            sample_to_meta[str(sample_id)] = raw_meta
+    return sample_to_meta, row_to_meta
 
 
 def collect_stats(meta_rows: Sequence[MetaInfo], assignments_path: Path) -> Stats:
@@ -451,6 +472,8 @@ def write_review_candidates(
             "row_idx": meta.row_idx,
             "sample_id": meta.sample_id,
             "scene_id": meta.scene_id,
+            "sample_token": meta.sample_token,
+            "timestamp": meta.timestamp,
             "primary_scene": meta.primary_scene,
             "secondary_scene": meta.secondary_scene,
             "cluster_id": cluster_id,

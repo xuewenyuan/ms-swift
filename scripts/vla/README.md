@@ -15,6 +15,8 @@ python3 scripts/vla/dump_messages_features.py \
   --input /path/to/train_jsonl_dir_or_file \
   --output-dir /path/to/feature_dump \
   --scene-id-key scene_id \
+  --sample-token-key sample_token \
+  --timestamp-key timestamp \
   --max-traj-points 10
 ```
 
@@ -64,8 +66,9 @@ scores, ids = index.search(x[:10], 20)
 
 Use `IndexFlatIP` with L2-normalized matrices for cosine-like similarity.
 
-`meta.jsonl` keeps `scene_id` by default when the input row has a `scene_id`
-field. Use `--scene-id-key` if the raw dataset uses another key.
+`meta.jsonl` keeps `scene_id`, `sample_token`, and `timestamp` by default when
+the input row has those fields. Use `--scene-id-key`, `--sample-token-key`, and
+`--timestamp-key` if the raw dataset uses other keys.
 
 ## FAISS clustering report
 
