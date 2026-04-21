@@ -45,6 +45,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Shard rows by global row_idx %% WORLD_SIZE == RANK and write one dump per rank.")
     parser.add_argument("--model", default=None, help="Optional model id/path for tokenizer ids only.")
     parser.add_argument("--sample-id-key", default="sample_id", help="Preferred sample id key.")
+    parser.add_argument("--scene-id-key", default="scene_id", help="Preferred scene id key kept in meta.jsonl.")
     parser.add_argument(
         "--input-text-scope",
         choices=["ego_state", "full"],
@@ -97,6 +98,7 @@ def main() -> None:
                 row,
                 row_idx,
                 args.sample_id_key,
+                args.scene_id_key,
                 tokenizer,
                 args.keep_text,
                 args.keep_token_ids,
@@ -247,6 +249,7 @@ def make_meta_row(feature: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "sample_id": feature["sample_id"],
         "row_idx": feature["row_idx"],
+        "scene_id": feature.get("scene_id"),
         "channel": feature.get("channel"),
         "input": {
             "sha1": feature["input"]["sha1"],
@@ -333,6 +336,7 @@ def build_feature(
         row: Dict[str, Any],
         row_idx: int,
         sample_id_key: str,
+        scene_id_key: str,
         tokenizer: Any = None,
         keep_text: bool = False,
         keep_token_ids: bool = False,
@@ -356,6 +360,7 @@ def build_feature(
     feature = {
         "sample_id": str(row.get(sample_id_key) or row.get("id") or f"row_{row_idx:08d}"),
         "row_idx": row_idx,
+        "scene_id": str(row.get(scene_id_key) or row.get("scene") or "") or None,
         "channel": row.get("channel"),
         "input": {
             "sha1": sha1(input_text),

@@ -14,6 +14,7 @@ By default, `input_text_hash.npy` is built from the ego-state segment between
 python3 scripts/vla/dump_messages_features.py \
   --input /path/to/train_jsonl_dir_or_file \
   --output-dir /path/to/feature_dump \
+  --scene-id-key scene_id \
   --max-traj-points 10
 ```
 
@@ -63,6 +64,9 @@ scores, ids = index.search(x[:10], 20)
 
 Use `IndexFlatIP` with L2-normalized matrices for cosine-like similarity.
 
+`meta.jsonl` keeps `scene_id` by default when the input row has a `scene_id`
+field. Use `--scene-id-key` if the raw dataset uses another key.
+
 ## FAISS clustering report
 
 `cluster_features_faiss.py` clusters the dumped feature matrix and writes
@@ -87,6 +91,10 @@ python3 scripts/vla/cluster_features_faiss.py \
   --gpu-devices 0,1,2,3
 ```
 
+`--gpu-devices` sets `CUDA_VISIBLE_DEVICES` before importing FAISS and then
+passes the visible GPU count to FAISS k-means. This avoids FAISS silently using
+only the first visible GPU when a physical device list is desired.
+
 The output directory contains:
 
 ```text
@@ -109,6 +117,70 @@ feature_dump_cluster_report/
 For real embeddings appended to `matrices/` and `manifest.json`, pass their
 matrix name with `--matrix`. Use `--metric cosine` for L2-normalized embeddings
 and `--metric l2` for raw Euclidean features.
+
+## Cluster mining for sampling and review
+
+`analyze_cluster_mining.py` enriches completed clustering results with scene
+labels, builds sampling buckets, and exports human-review candidates. It does
+not rerun FAISS.
+
+The scene mapping is passed as JSON:
+
+```json
+{
+  "9f94da7ee64f4bfab4e270864aec0fce": {
+    "专题": "调平",
+    "二级场景": "导航换道lane_remain调平"
+  }
+}
+```
+
+Run it on an existing feature dump and cluster report:
+
+```shell
+python3 scripts/vla/analyze_cluster_mining.py \
+  --feature-dir /path/to/feature_dump \
+  --cluster-dir /path/to/feature_dump_cluster_report \
+  --scene-map /path/to/scene_map.json \
+  --output-dir /path/to/mining_report
+```
+
+If the feature dump was created before `scene_id` was kept in `meta.jsonl`, pass
+the original JSONL file or directory to recover it:
+
+```shell
+python3 scripts/vla/analyze_cluster_mining.py \
+  --feature-dir /path/to/old_feature_dump \
+  --cluster-dir /path/to/feature_dump_cluster_report \
+  --scene-map /path/to/scene_map.json \
+  --raw-input /path/to/train_jsonl_dir_or_file \
+  --output-dir /path/to/mining_report
+```
+
+The output directory contains:
+
+```text
+mining_report/
+  mining_summary.md
+  mining_summary.json
+  cluster_decision_distribution.csv
+  cluster_primary_scene_distribution.csv
+  cluster_secondary_scene_distribution.csv
+  label_cluster_distribution.csv
+  scene_decision_counts.csv
+  sampling_buckets.csv
+  conditional_cluster_jobs.jsonl
+  review_candidates.jsonl
+```
+
+- `sampling_buckets.csv`: recommended sampling unit
+  `(一级场景, decision label, cluster_id)`, with secondary-scene distribution,
+  cluster purity, bucket ratios, suggested action, sample weight, and target
+  count.
+- `review_candidates.jsonl`: candidates for human review, including
+  `low_cluster_closeness`, `minority_in_cluster`, and `rare_scene_decision`.
+- `conditional_cluster_jobs.jsonl`: large `(一级场景, decision label)` buckets
+  worth running label-conditioned clustering on next.
 
 ## Distributed dump
 
