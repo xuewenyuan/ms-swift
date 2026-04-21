@@ -40,6 +40,16 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Comma-separated GPU ids for FAISS k-means, for example: 0,1,2,3. Implies --gpu.")
     parser.add_argument(
+        "--kmeans-device",
+        choices=["auto", "cpu", "gpu"],
+        default="auto",
+        help="Device used for FAISS k-means training. Default: auto.")
+    parser.add_argument(
+        "--gpu-min-train-points",
+        type=int,
+        default=100000,
+        help="In auto mode, use CPU when sampled k-means train points are below this threshold. Default: 100000.")
+    parser.add_argument(
         "--max-points-per-centroid",
         type=int,
         default=256,
@@ -64,8 +74,6 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     gpu_devices = parse_gpu_devices(args.gpu_devices)
-    configure_cuda_visible_devices(gpu_devices)
-    faiss = import_faiss()
     dump = load_dump(input_dir, args.matrix)
     meta_rows = dump["meta_rows"]
     x = dump["matrix"]
@@ -82,6 +90,10 @@ def main() -> None:
     pair_counts = Counter(decision_pairs)
     num_clusters = args.num_clusters or len(pair_counts)
     num_clusters = validate_num_clusters(num_clusters, x.shape[0])
+    use_gpu_kmeans = resolve_kmeans_gpu(args, gpu_devices, x.shape[0], num_clusters)
+    configure_cuda_visible_devices(gpu_devices if use_gpu_kmeans else None)
+    faiss = import_faiss()
+    validate_faiss_gpu(faiss, use_gpu_kmeans)
 
     cluster_ids, closeness, centroids = run_faiss_kmeans(
         faiss,
@@ -91,8 +103,8 @@ def main() -> None:
         niter=args.niter,
         nredo=args.nredo,
         seed=args.seed,
-        gpu=args.gpu,
-        gpu_devices=gpu_devices,
+        use_gpu=use_gpu_kmeans,
+        gpu_devices=gpu_devices if use_gpu_kmeans else None,
         max_points_per_centroid=args.max_points_per_centroid,
     )
 
@@ -128,6 +140,13 @@ def import_faiss():
     return faiss
 
 
+def validate_faiss_gpu(faiss: Any, use_gpu: bool) -> None:
+    if not use_gpu:
+        return
+    if not hasattr(faiss, "StandardGpuResources"):
+        raise RuntimeError("The installed faiss package does not expose GPU resources. Please install faiss-gpu.")
+
+
 def parse_gpu_devices(value: Optional[str]) -> Optional[List[int]]:
     if value is None or value.strip() == "":
         return None
@@ -157,6 +176,29 @@ def configure_cuda_visible_devices(gpu_devices: Optional[Sequence[int]]) -> None
         print(f"Overriding CUDA_VISIBLE_DEVICES={existing} with {visible_devices} for FAISS.")
     os.environ["CUDA_VISIBLE_DEVICES"] = visible_devices
     print(f"Using FAISS GPUs via CUDA_VISIBLE_DEVICES={visible_devices}")
+
+
+def resolve_kmeans_gpu(args: argparse.Namespace, gpu_devices: Optional[Sequence[int]], num_rows: int,
+                       num_clusters: int) -> bool:
+    gpu_requested = bool(args.gpu or gpu_devices)
+    sampled_train_points = min(num_rows, max(1, num_clusters) * max(1, args.max_points_per_centroid))
+    if args.kmeans_device == "cpu":
+        if gpu_requested:
+            print("Using CPU k-means training because --kmeans-device cpu was set; ignoring GPU flags.")
+        return False
+    if args.kmeans_device == "gpu":
+        print(f"Using GPU k-means training with about {sampled_train_points} sampled train points.")
+        return True
+    if not gpu_requested:
+        return False
+    if sampled_train_points < args.gpu_min_train_points:
+        print(
+            "Using CPU k-means training because sampled train points "
+            f"({sampled_train_points}) < --gpu-min-train-points ({args.gpu_min_train_points}). "
+            "This avoids FAISS GPU CUBLAS failures on small GEMMs; pass --kmeans-device gpu to force GPU.")
+        return False
+    print(f"Using GPU k-means training with about {sampled_train_points} sampled train points.")
+    return True
 
 
 def load_dump(input_dir: Path, matrix_arg: str) -> Dict[str, Any]:
@@ -213,10 +255,10 @@ def run_faiss_kmeans(
         niter: int,
         nredo: int,
         seed: int,
-        gpu: bool,
+        use_gpu: bool,
         gpu_devices: Optional[Sequence[int]],
         max_points_per_centroid: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    gpu_setting: Any = len(gpu_devices) if gpu_devices else gpu
+    gpu_setting: Any = len(gpu_devices) if gpu_devices else use_gpu
     kwargs = {
         "niter": niter,
         "nredo": nredo,

@@ -95,8 +95,12 @@ python3 scripts/vla/cluster_features_faiss.py \
 ```
 
 `--gpu-devices` sets `CUDA_VISIBLE_DEVICES` before importing FAISS and then
-passes the visible GPU count to FAISS k-means. This avoids FAISS silently using
-only the first visible GPU when a physical device list is desired.
+passes the visible GPU count to FAISS k-means when GPU training is selected.
+By default, `--kmeans-device auto` uses CPU k-means if the sampled training set
+is small, because FAISS GPU can hit CUBLAS failures on tiny GEMMs such as a
+35-centroid, 256-dim clustering run. Use `--kmeans-device gpu` to force GPU
+k-means, or lower `--gpu-min-train-points` if you want auto mode to use GPU
+more aggressively.
 
 The output directory contains:
 
