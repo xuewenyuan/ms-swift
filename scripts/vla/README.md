@@ -1,12 +1,15 @@
 # VLA Feature Dump
 
 `dump_messages_features.py` extracts curation features from ms-swift messages-format VLA data.
+`--input` accepts either one `.jsonl` file or a directory. For directory input,
+the script recursively finds all `*.jsonl` files and processes them in sorted
+path order.
 
 ## FAISS-friendly dump
 
 ```shell
 python3 scripts/vla/dump_messages_features.py \
-  --input /path/to/train.jsonl \
+  --input /path/to/train_jsonl_dir_or_file \
   --output-dir /path/to/feature_dump \
   --max-traj-points 10
 ```
@@ -56,6 +59,43 @@ scores, ids = index.search(x[:10], 20)
 ```
 
 Use `IndexFlatIP` with L2-normalized matrices for cosine-like similarity.
+
+## FAISS clustering report
+
+`cluster_features_faiss.py` clusters the dumped feature matrix and writes
+analysis files for abnormal-class inspection. By default, the cluster count is
+the number of unique lateral/longitudinal decision combinations in `meta.jsonl`.
+It requires `faiss-cpu` or `faiss-gpu` in the active Python environment.
+
+```shell
+python3 scripts/vla/cluster_features_faiss.py \
+  --input-dir /path/to/feature_dump \
+  --output-dir /path/to/feature_dump_cluster_report \
+  --matrix curation_fused
+```
+
+The output directory contains:
+
+```text
+feature_dump_cluster_report/
+  cluster_assignments.jsonl
+  cluster_summary.json
+  cluster_report.md
+  centroids.npy
+```
+
+- `cluster_report.md`: human-readable report with potential abnormal clusters,
+  smallest clusters, lowest-closeness samples, largest clusters, and decision
+  pair counts. It also includes every cluster's lateral/longitudinal decision
+  pair distribution and per-cluster ratios.
+- `cluster_summary.json`: structured cluster statistics for downstream analysis.
+- `cluster_assignments.jsonl`: per-row `sample_id`, original `row_idx`,
+  cluster id, lateral/longitudinal labels, and centroid closeness.
+- `centroids.npy`: learned FAISS k-means centroids.
+
+For real embeddings appended to `matrices/` and `manifest.json`, pass their
+matrix name with `--matrix`. Use `--metric cosine` for L2-normalized embeddings
+and `--metric l2` for raw Euclidean features.
 
 ## Distributed dump
 

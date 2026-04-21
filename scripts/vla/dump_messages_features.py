@@ -28,7 +28,10 @@ POINT_TOKEN_RE = re.compile(r"<P_(\d+)>")
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Extract curation features from messages-format VLA JSONL data.")
-    parser.add_argument("--input", required=True, help="Input JSONL in ms-swift messages format.")
+    parser.add_argument(
+        "--input",
+        required=True,
+        help="Input JSONL file or directory. When a directory is provided, recursively loads all *.jsonl files.")
     parser.add_argument("--output", default=None, help="Legacy output feature JSONL.")
     parser.add_argument(
         "--output-dir",
@@ -60,7 +63,9 @@ def main() -> None:
         raise ValueError("Please set at least one of --output or --output-dir.")
     rank, world_size = get_runtime_rank_world(args.distributed)
     tokenizer = load_tokenizer(args.model) if args.model else None
-    rows = iter_jsonl(Path(args.input))
+    input_path = Path(args.input)
+    input_files = resolve_input_files(input_path)
+    rows = iter_jsonl_files(input_files)
     legacy_f = None
     if args.output:
         out_path = rank_path(Path(args.output), rank, world_size) if args.distributed else Path(args.output)
@@ -91,7 +96,11 @@ def main() -> None:
         if legacy_f is not None:
             legacy_f.close()
     if writer is not None:
-        writer.close(input_path=str(Path(args.input)), model=args.model, dist={"rank": rank, "world_size": world_size})
+        writer.close(
+            input_path=str(input_path),
+            input_files=[str(path) for path in input_files],
+            model=args.model,
+            dist={"rank": rank, "world_size": world_size})
         print(f"[rank {rank}/{world_size}] dumped {count}/{seen} feature rows -> {writer.output_dir}")
     if args.output:
         print(f"[rank {rank}/{world_size}] dumped {count}/{seen} feature rows -> {legacy_f.name if legacy_f else args.output}")
@@ -161,7 +170,13 @@ class FaissDumpWriter:
         self.curation_fused.append(fused_vec)
         self.count += 1
 
-    def close(self, *, input_path: str, model: Optional[str], dist: Optional[Dict[str, int]] = None) -> None:
+    def close(
+            self,
+            *,
+            input_path: str,
+            input_files: Optional[Sequence[str]] = None,
+            model: Optional[str],
+            dist: Optional[Dict[str, int]] = None) -> None:
         self.meta_f.close()
         self.index_f.close()
         self.sample_id_f.close()
@@ -192,6 +207,7 @@ class FaissDumpWriter:
             "format": "vla-faiss-feature-dump",
             "version": 1,
             "input_path": input_path,
+            "input_files": input_files or [input_path],
             "model": model,
             "distributed": dist or {"rank": 0, "world_size": 1},
             "num_rows": self.count,
@@ -472,6 +488,24 @@ def strip_token(token: str) -> str:
 
 def sha1(text: str) -> str:
     return hashlib.sha1(text.encode("utf-8")).hexdigest()
+
+
+def resolve_input_files(path: Path) -> List[Path]:
+    if path.is_file():
+        if path.suffix != ".jsonl":
+            raise ValueError(f"input file must be a .jsonl file: {path}")
+        return [path]
+    if path.is_dir():
+        files = sorted(p for p in path.rglob("*.jsonl") if p.is_file())
+        if not files:
+            raise ValueError(f"no .jsonl files found under input directory: {path}")
+        return files
+    raise FileNotFoundError(f"input path does not exist: {path}")
+
+
+def iter_jsonl_files(paths: Sequence[Path]) -> Iterable[Dict[str, Any]]:
+    for path in paths:
+        yield from iter_jsonl(path)
 
 
 def iter_jsonl(path: Path) -> Iterable[Dict[str, Any]]:
