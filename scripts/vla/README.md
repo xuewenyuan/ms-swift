@@ -231,6 +231,29 @@ adaptive_report/
 - `adaptive_review_candidates.jsonl`: suspected label issues from high-purity
   leaf minorities and leaves that remain impure after recursive splitting.
 
+## Sampling raw JSONL from bucket targets
+
+`sample_from_buckets.py` applies `sampling_buckets.csv` targets back to the
+original JSONL data. It reconstructs each row's mining bucket
+`(一级场景, decision label, cluster_id)` from `meta.jsonl`,
+`cluster_assignments.jsonl`, and the scene map, then samples up to
+`suggested_target_count` rows per bucket.
+
+```shell
+python3 scripts/vla/sample_from_buckets.py \
+  --raw-input /path/to/train_jsonl_dir_or_file \
+  --feature-dir /path/to/feature_dump \
+  --cluster-dir /path/to/feature_dump_cluster_report \
+  --scene-map /path/to/scene_map.json \
+  --sampling-buckets /path/to/mining_report/sampling_buckets.csv \
+  --output /path/to/balanced_train.jsonl
+```
+
+By default sampling is without replacement, so targets larger than the available
+bucket size are capped. Use `--sampling-mode with_replacement` if you want true
+upsampling. A per-bucket report is written next to the output JSONL unless
+`--report` is set.
+
 ## Mining dashboard
 
 `visualize_cluster_mining.py` turns the mining report directory into a static
