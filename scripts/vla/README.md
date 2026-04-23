@@ -189,6 +189,69 @@ mining_report/
 - `conditional_cluster_jobs.jsonl`: large `(一级场景, decision label)` buckets
   worth running label-conditioned clustering on next.
 
+## Adaptive clustering for sampling diversity
+
+`adaptive_cluster_mining.py` recursively splits only the leaves that are not yet
+useful for data mining: low-purity leaves are split to improve label separation,
+and high-purity but oversized leaves are split to improve sampling diversity.
+Leaves that are already pure enough and not too large stop early.
+
+```shell
+python3 scripts/vla/adaptive_cluster_mining.py \
+  --feature-dir /path/to/feature_dump \
+  --output-dir /path/to/adaptive_report \
+  --matrix input_text_hash \
+  --scene-map /path/to/scene_map.json \
+  --purity-threshold 0.7 \
+  --min-leaf-size 500 \
+  --max-leaf-size 50000 \
+  --max-depth 3
+```
+
+This workflow is intended for "sampling balance and diversity first, suspected
+label-error mining second". It outputs:
+
+```text
+adaptive_report/
+  adaptive_summary.md
+  adaptive_summary.json
+  adaptive_tree.json
+  adaptive_leaf_summary.csv
+  adaptive_leaf_decision_distribution.csv
+  adaptive_leaf_scene_distribution.csv
+  adaptive_leaf_assignments.jsonl
+  adaptive_review_candidates.jsonl
+```
+
+- `adaptive_leaf_summary.csv`: final sampling leaves with purity, dominant
+  decision, top scenes, stop reason, suggested action, and suggested target
+  count.
+- `adaptive_leaf_assignments.jsonl`: per-row leaf id and source metadata for
+  building train manifests.
+- `adaptive_review_candidates.jsonl`: suspected label issues from high-purity
+  leaf minorities and leaves that remain impure after recursive splitting.
+
+## Mining dashboard
+
+`visualize_cluster_mining.py` turns the mining report directory into a static
+HTML dashboard. The Python script uses only the standard library; the generated
+HTML loads Plotly.js in the browser.
+
+```shell
+python3 scripts/vla/visualize_cluster_mining.py \
+  --mining-dir /path/to/mining_report \
+  --output /path/to/mining_dashboard.html
+```
+
+The dashboard includes:
+
+- overview cards and top-level distributions;
+- sampling treemap and raw-vs-target sampling charts;
+- cluster size/purity and label-dispersion charts;
+- primary-scene x decision-label heatmap;
+- review-candidate scatter plot and table;
+- conditional clustering job table.
+
 ## Distributed dump
 
 The script can reuse ms-swift's distributed environment helpers. Launch it with
