@@ -251,6 +251,24 @@ coarsen or refine the split, for example `primary_scene_leaf`, `label_leaf`,
 `primary_scene_label`, or `suggested_action`. By default the raw JSON rows are
 kept unchanged; use `--add-mining-meta` to attach an `_adaptive_mining` field.
 
+`build_adaptive_dataset_info.py` converts `split_manifest.csv` into an
+ms-swift custom dataset info JSON. Each leaf file becomes one `dataset_name`, and
+leaf metadata is recorded in the supported `tags` and `help` fields.
+
+```shell
+python3 scripts/vla/build_adaptive_dataset_info.py \
+  --split-manifest /path/to/adaptive_leaf_jsonl/split_manifest.csv \
+  --output /path/to/adaptive_leaf_dataset_info.json \
+  --dataset-name-prefix vla_ego \
+  --min-purity 0.7 \
+  --downsample-high-purity
+```
+
+Use the generated JSON with `--custom_dataset_info`. The companion
+`*.dataset_args.txt` contains recommended dataset arguments; with
+`--downsample-high-purity`, entries whose target is smaller than their raw count
+are written as `dataset_name#target_count`.
+
 ## Sampling raw JSONL from bucket targets
 
 `sample_from_buckets.py` applies `sampling_buckets.csv` targets back to the
