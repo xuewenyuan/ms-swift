@@ -57,6 +57,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--add-mining-meta",
         action="store_true",
         help="Add an _adaptive_mining field to each output JSON object. By default raw rows are kept unchanged.")
+    parser.add_argument(
+        "--add-channel",
+        action="store_true",
+        help="Add a channel field to each output row for ms-swift --enable_channel_loss monitoring.")
+    parser.add_argument("--channel-key", default="channel", help="Channel field name to write. Default: channel.")
+    parser.add_argument("--channel-prefix", default="vla_adaptive", help="Channel name prefix. Default: vla_adaptive.")
     return parser
 
 
@@ -82,6 +88,9 @@ def main() -> None:
         args.group_by,
         args.max_open_files,
         args.add_mining_meta,
+        args.add_channel,
+        args.channel_key,
+        args.channel_prefix,
     )
     manifest_rows = build_manifest_rows(stats, group_paths, leaf_summaries)
     write_csv(manifest_path, manifest_rows)
@@ -166,11 +175,46 @@ def build_group_paths(
         group_by: str,
         output_dir: Path,
         filename_prefix: str) -> Dict[GroupKey, Path]:
-    groups = sorted({group_key(item, leaf_summaries, group_by) for item in assignments.values()})
-    return {
-        key: output_dir / f"{filename_prefix}__{sanitize_filename(key)}__{short_hash(key)}.jsonl"
-        for key in groups
-    }
+    key_to_items: DefaultDict[GroupKey, List[Dict[str, Any]]] = defaultdict(list)
+    for item in assignments.values():
+        key_to_items[group_key(item, leaf_summaries, group_by)].append(item)
+    used_names: Set[str] = set()
+    paths = {}
+    for key in sorted(key_to_items):
+        filename = group_filename(filename_prefix, key, key_to_items[key], leaf_summaries, used_names)
+        paths[key] = output_dir / filename
+    return paths
+
+
+def group_filename(
+        prefix: str,
+        key: GroupKey,
+        items: Sequence[Dict[str, Any]],
+        leaf_summaries: Dict[int, Dict[str, str]],
+        used_names: Set[str]) -> str:
+    leaf_ids = sorted({int(item["leaf_id"]) for item in items})
+    dominant, _ = top_item(Counter(str(item.get("dominant_label") or UNKNOWN) for item in items))
+    purity = average_leaf_purity(items, leaf_summaries)
+    if len(leaf_ids) == 1:
+        base = f"{prefix}_leaf_{leaf_ids[0]:06d}_{purity_token(purity)}_{dominant}"
+    else:
+        base = f"{prefix}_{sanitize_channel(key, max_len=80)}_{purity_token(purity)}_{dominant}"
+    name = sanitize_channel(base)
+    if name in used_names:
+        name = f"{name}_{short_hash(key)}"
+    used_names.add(name)
+    return f"{name}.jsonl"
+
+
+def average_leaf_purity(items: Sequence[Dict[str, Any]], leaf_summaries: Dict[int, Dict[str, str]]) -> float:
+    if not items:
+        return 0.0
+    total = 0.0
+    for item in items:
+        leaf_id = int(item["leaf_id"])
+        summary = leaf_summaries.get(leaf_id, {})
+        total += to_float(item.get("leaf_purity") or summary.get("purity") or summary.get("avg_leaf_purity"))
+    return total / len(items)
 
 
 def split_raw_rows(
@@ -180,7 +224,10 @@ def split_raw_rows(
         group_paths: Dict[GroupKey, Path],
         group_by: str,
         max_open_files: int,
-        add_mining_meta: bool) -> Dict[GroupKey, GroupStats]:
+        add_mining_meta: bool,
+        add_channel: bool,
+        channel_key: str,
+        channel_prefix: str) -> Dict[GroupKey, GroupStats]:
     stats: DefaultDict[GroupKey, GroupStats] = defaultdict(GroupStats)
     writer = WriterPool(max_open_files)
     seen_rows: Set[int] = set()
@@ -190,7 +237,9 @@ def split_raw_rows(
             if assignment is None:
                 continue
             key = group_key(assignment, leaf_summaries, group_by)
-            writer.write(group_paths[key], output_line(line, assignment, leaf_summaries, add_mining_meta))
+            writer.write(group_paths[key],
+                         output_line(line, assignment, leaf_summaries, add_mining_meta, add_channel, channel_key,
+                                     channel_prefix))
             update_stats(stats[key], assignment, leaf_summaries)
             seen_rows.add(row_idx)
     finally:
@@ -205,26 +254,50 @@ def output_line(
         raw_line: str,
         assignment: Dict[str, Any],
         leaf_summaries: Dict[int, Dict[str, str]],
-        add_mining_meta: bool) -> str:
-    if not add_mining_meta:
+        add_mining_meta: bool,
+        add_channel: bool,
+        channel_key: str,
+        channel_prefix: str) -> str:
+    if not add_mining_meta and not add_channel:
         return raw_line.rstrip("\n") + "\n"
     row = json.loads(raw_line)
     leaf_id = int(assignment["leaf_id"])
     summary = leaf_summaries.get(leaf_id, {})
-    row["_adaptive_mining"] = {
-        "leaf_id": leaf_id,
-        "node_id": assignment.get("node_id"),
-        "depth": assignment.get("depth"),
-        "path": assignment.get("path"),
-        "label": assignment.get("label"),
-        "dominant_label": assignment.get("dominant_label"),
-        "leaf_purity": assignment.get("leaf_purity"),
-        "closeness": assignment.get("closeness"),
-        "is_dominant_label": assignment.get("is_dominant_label"),
-        "suggested_action": summary.get("suggested_action"),
-        "suggested_target_count": to_int(summary.get("suggested_target_count")),
-    }
+    if add_channel:
+        row[channel_key] = channel_name(channel_prefix, assignment, summary)
+    if add_mining_meta:
+        row["_adaptive_mining"] = {
+            "leaf_id": leaf_id,
+            "node_id": assignment.get("node_id"),
+            "depth": assignment.get("depth"),
+            "path": assignment.get("path"),
+            "label": assignment.get("label"),
+            "dominant_label": assignment.get("dominant_label"),
+            "leaf_purity": assignment.get("leaf_purity"),
+            "closeness": assignment.get("closeness"),
+            "is_dominant_label": assignment.get("is_dominant_label"),
+            "suggested_action": summary.get("suggested_action"),
+            "suggested_target_count": to_int(summary.get("suggested_target_count")),
+        }
     return json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n"
+
+
+def channel_name(prefix: str, assignment: Dict[str, Any], summary: Dict[str, str]) -> str:
+    leaf_id = int(assignment["leaf_id"])
+    purity = to_float(assignment.get("leaf_purity") or summary.get("purity") or summary.get("avg_leaf_purity"))
+    dominant = str(assignment.get("dominant_label") or summary.get("dominant_label") or UNKNOWN)
+    return sanitize_channel(f"{prefix}_leaf_{leaf_id:06d}_{purity_token(purity)}_{dominant}")
+
+
+def sanitize_channel(value: str, max_len: int = 120) -> str:
+    value = re.sub(r"[^0-9A-Za-z_]+", "_", value)
+    value = re.sub(r"_+", "_", value).strip("_")
+    return (value or "channel")[:max_len]
+
+
+def purity_token(value: float) -> str:
+    value = max(0.0, min(1.0, value))
+    return f"p{int(round(value * 1000)):04d}"
 
 
 def update_stats(stats: GroupStats, assignment: Dict[str, Any], leaf_summaries: Dict[int, Dict[str, str]]) -> None:

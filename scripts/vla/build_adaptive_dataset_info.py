@@ -28,6 +28,14 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional JSON with rich per-leaf metadata and recommended dataset args.")
     parser.add_argument(
+        "--config-fragment-output",
+        default=None,
+        help="Optional YAML config fragment with custom_dataset_info and dataset entries.")
+    parser.add_argument(
+        "--enable-channel-loss-in-config",
+        action="store_true",
+        help="Add enable_channel_loss: true to the generated YAML fragment.")
+    parser.add_argument(
         "--path-mode",
         choices=["absolute", "relative"],
         default="absolute",
@@ -109,9 +117,15 @@ def main() -> None:
         "rows": plan_rows,
     }
     plan_output.write_text(json.dumps(plan, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    config_fragment_output = Path(args.config_fragment_output) if args.config_fragment_output else output_path.with_suffix(
+        output_path.suffix + ".dataset_config.yaml")
+    config_fragment_output.parent.mkdir(parents=True, exist_ok=True)
+    config_fragment_output.write_text(
+        render_config_fragment(output_path, plan_rows, args.enable_channel_loss_in_config), encoding="utf-8")
     print(f"wrote {len(dataset_entries)} ms-swift dataset entries -> {output_path}")
     print(f"recommended dataset args -> {dataset_args_output}")
     print(f"sampling plan -> {plan_output}")
+    print(f"dataset config fragment -> {config_fragment_output}")
 
 
 def read_manifest(path: Path) -> Iterable[Dict[str, str]]:
@@ -240,12 +254,29 @@ def build_tags(row: Dict[str, str]) -> List[str]:
     ]
 
 
+def render_config_fragment(dataset_info_path: Path, plan_rows: Sequence[Dict[str, Any]],
+                           enable_channel_loss: bool) -> str:
+    lines = [
+        "# Paste this block into a swift --config YAML file.",
+        "custom_dataset_info:",
+        f"  - {yaml_quote(str(dataset_info_path))}",
+        "dataset:",
+    ]
+    for row in plan_rows:
+        lines.append(f"  - {yaml_quote(str(row['recommended_dataset_arg']))}")
+    if enable_channel_loss:
+        lines.append("enable_channel_loss: true")
+    return "\n".join(lines) + "\n"
+
+
 def unique_name(prefix: str, row: Dict[str, str], used_names: set) -> str:
     leaf_ids = [part for part in row["leaf_ids"].split() if part]
+    purity = purity_token(to_float(row["avg_leaf_purity"]))
+    dominant = sanitize_name(row["dominant_label"], max_len=64)
     if len(leaf_ids) == 1:
-        base = f"{prefix}_leaf_{int(leaf_ids[0]):06d}"
+        base = f"{prefix}_leaf_{int(leaf_ids[0]):06d}_{purity}_{dominant}"
     else:
-        base = f"{prefix}_{sanitize_name(row['group_key'], max_len=80)}"
+        base = f"{prefix}_{sanitize_name(row['group_key'], max_len=80)}_{purity}_{dominant}"
     name = sanitize_name(base, max_len=120)
     if name not in used_names:
         used_names.add(name)
@@ -284,9 +315,18 @@ def sanitize_name(value: str, max_len: int = 120) -> str:
     return (value or "dataset")[:max_len]
 
 
+def purity_token(value: float) -> str:
+    value = max(0.0, min(1.0, value))
+    return f"p{int(round(value * 1000)):04d}"
+
+
 def sanitize_tag(value: str, max_len: int = 80) -> str:
     value = re.sub(r"[\s,;]+", "_", value)
     return (value or "UNKNOWN")[:max_len]
+
+
+def yaml_quote(value: str) -> str:
+    return json.dumps(value, ensure_ascii=False)
 
 
 def safe_div(numerator: float, denominator: float) -> float:

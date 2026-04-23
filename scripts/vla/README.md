@@ -236,6 +236,8 @@ adaptive_report/
 `split_raw_by_adaptive_leaf.py` maps `adaptive_leaf_assignments.jsonl` back to
 the original JSONL row order and writes one JSONL per adaptive group. The default
 group is one file per leaf, which makes each file a diversity/sampling unit.
+For leaf grouping, output filenames use
+`<prefix>_leaf_<leaf_id>_<purity>_<dominant_label>.jsonl`.
 
 ```shell
 python3 scripts/vla/split_raw_by_adaptive_leaf.py \
@@ -250,10 +252,14 @@ top scenes, average leaf purity, and suggested action. Use `--group-by` to
 coarsen or refine the split, for example `primary_scene_leaf`, `label_leaf`,
 `primary_scene_label`, or `suggested_action`. By default the raw JSON rows are
 kept unchanged; use `--add-mining-meta` to attach an `_adaptive_mining` field.
+Use `--add-channel` if you want ms-swift to log per-leaf channel loss with
+`--enable_channel_loss true`.
 
 `build_adaptive_dataset_info.py` converts `split_manifest.csv` into an
 ms-swift custom dataset info JSON. Each leaf file becomes one `dataset_name`, and
 leaf metadata is recorded in the supported `tags` and `help` fields.
+Generated dataset names include the leaf id, purity token, and dominant
+decision, for example `vla_ego_leaf_000012_p0950_LAT_LANE_KEEP_LON_MAINTAIN`.
 
 ```shell
 python3 scripts/vla/build_adaptive_dataset_info.py \
@@ -268,6 +274,9 @@ Use the generated JSON with `--custom_dataset_info`. The companion
 `*.dataset_args.txt` contains recommended dataset arguments; with
 `--downsample-high-purity`, entries whose target is smaller than their raw count
 are written as `dataset_name#target_count`.
+The companion `*.dataset_config.yaml` can be pasted into a `swift --config`
+YAML file so hundreds of leaf datasets do not need to be typed on the command
+line.
 
 ## Sampling raw JSONL from bucket targets
 
