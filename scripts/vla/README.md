@@ -231,6 +231,26 @@ adaptive_report/
 - `adaptive_review_candidates.jsonl`: suspected label issues from high-purity
   leaf minorities and leaves that remain impure after recursive splitting.
 
+## Split raw JSONL by adaptive leaves
+
+`split_raw_by_adaptive_leaf.py` maps `adaptive_leaf_assignments.jsonl` back to
+the original JSONL row order and writes one JSONL per adaptive group. The default
+group is one file per leaf, which makes each file a diversity/sampling unit.
+
+```shell
+python3 scripts/vla/split_raw_by_adaptive_leaf.py \
+  --raw-input /path/to/train_jsonl_dir_or_file \
+  --adaptive-dir /path/to/adaptive_report \
+  --output-dir /path/to/adaptive_leaf_jsonl
+```
+
+The output directory contains split JSONL files plus `split_manifest.csv` with
+each file's row count, proportional `suggested_target_count`, dominant decision,
+top scenes, average leaf purity, and suggested action. Use `--group-by` to
+coarsen or refine the split, for example `primary_scene_leaf`, `label_leaf`,
+`primary_scene_label`, or `suggested_action`. By default the raw JSON rows are
+kept unchanged; use `--add-mining-meta` to attach an `_adaptive_mining` field.
+
 ## Sampling raw JSONL from bucket targets
 
 `sample_from_buckets.py` applies `sampling_buckets.csv` targets back to the
