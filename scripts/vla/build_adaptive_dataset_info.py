@@ -45,6 +45,21 @@ def build_parser() -> argparse.ArgumentParser:
         default="suggested_target_count",
         help="Column used for recommended downsample count. Default: suggested_target_count.")
     parser.add_argument(
+        "--purity-ratio-threshold",
+        type=float,
+        default=None,
+        help="If avg_leaf_purity is greater than this value, override target with count * --purity-sample-ratio.")
+    parser.add_argument(
+        "--purity-sample-ratio",
+        type=float,
+        default=None,
+        help="Sampling ratio for rows whose avg_leaf_purity is greater than --purity-ratio-threshold.")
+    parser.add_argument(
+        "--non-purity-target-mode",
+        choices=["suggested_target_count", "full"],
+        default="suggested_target_count",
+        help="Target policy for rows not matching the purity-ratio rule. Default: suggested_target_count.")
+    parser.add_argument(
         "--min-purity",
         type=float,
         default=None,
@@ -76,6 +91,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_parser().parse_args()
+    validate_args(args)
     manifest_path = Path(args.split_manifest)
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -83,7 +99,8 @@ def main() -> None:
     rows = list(read_manifest(manifest_path))
     selected_rows = [
         row for row in rows
-        if row_matches(row, args.target_column, args.min_purity, args.max_purity, action_filter, args.min_target_count)
+        if row_matches(row, args.target_column, args.min_purity, args.max_purity, action_filter, args.min_target_count,
+                       args.purity_ratio_threshold, args.purity_sample_ratio, args.non_purity_target_mode)
     ]
     dataset_entries, plan_rows = build_dataset_entries(
         selected_rows,
@@ -92,6 +109,9 @@ def main() -> None:
         args.dataset_name_prefix,
         args.target_column,
         args.path_mode,
+        args.purity_ratio_threshold,
+        args.purity_sample_ratio,
+        args.non_purity_target_mode,
         emit_columns=not args.no_columns,
         downsample_high_purity=args.downsample_high_purity,
     )
@@ -152,6 +172,13 @@ def read_manifest(path: Path) -> Iterable[Dict[str, str]]:
         yield from reader
 
 
+def validate_args(args: argparse.Namespace) -> None:
+    if (args.purity_ratio_threshold is None) != (args.purity_sample_ratio is None):
+        raise ValueError("--purity-ratio-threshold and --purity-sample-ratio must be set together")
+    if args.purity_sample_ratio is not None and not 0 <= args.purity_sample_ratio <= 1:
+        raise ValueError("--purity-sample-ratio must be in [0, 1]")
+
+
 def build_dataset_entries(
         rows: Sequence[Dict[str, str]],
         manifest_dir: Path,
@@ -159,6 +186,9 @@ def build_dataset_entries(
         dataset_name_prefix: str,
         target_column: str,
         path_mode: str,
+        purity_ratio_threshold: Optional[float],
+        purity_sample_ratio: Optional[float],
+        non_purity_target_mode: str,
         *,
         emit_columns: bool,
         downsample_high_purity: bool) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
@@ -169,11 +199,12 @@ def build_dataset_entries(
         dataset_name = unique_name(dataset_name_prefix, row, used_names)
         dataset_path = format_dataset_path(resolve_manifest_file(row["file"], manifest_dir), output_path, path_mode)
         count = to_int(row["count"])
-        target = min(count, max(0, to_int(row[target_column])))
+        target, target_source = target_count(row, target_column, purity_ratio_threshold, purity_sample_ratio,
+                                             non_purity_target_mode)
         recommended_arg = dataset_name
-        if downsample_high_purity and 0 < target < count:
+        if (downsample_high_purity or target_source != "full") and target < count:
             recommended_arg = f"{dataset_name}#{target}"
-        help_text = build_help(row, target)
+        help_text = build_help(row, target, target_source)
         tags = build_tags(row)
         entry: Dict[str, Any] = {
             "dataset_path": dataset_path,
@@ -192,6 +223,7 @@ def build_dataset_entries(
             "recommended_sample_count": target if "#" in recommended_arg else count,
             "raw_count": count,
             "target_count": target,
+            "target_source": target_source,
             "sample_ratio": safe_div(target, count),
             "leaf_ids": row["leaf_ids"],
             "group_key": row["group_key"],
@@ -213,7 +245,10 @@ def row_matches(
         min_purity: Optional[float],
         max_purity: Optional[float],
         action_filter: Optional[set],
-        min_target_count: int) -> bool:
+        min_target_count: int,
+        purity_ratio_threshold: Optional[float],
+        purity_sample_ratio: Optional[float],
+        non_purity_target_mode: str) -> bool:
     purity = to_float(row["avg_leaf_purity"])
     if min_purity is not None and purity < min_purity:
         return False
@@ -221,16 +256,34 @@ def row_matches(
         return False
     if action_filter is not None and row["suggested_action_top"] not in action_filter:
         return False
-    return to_int(row[target_column]) >= min_target_count
+    target, _ = target_count(row, target_column, purity_ratio_threshold, purity_sample_ratio, non_purity_target_mode)
+    return target >= min_target_count
 
 
-def build_help(row: Dict[str, str], target: int) -> str:
+def target_count(
+        row: Dict[str, str],
+        target_column: str,
+        purity_ratio_threshold: Optional[float],
+        purity_sample_ratio: Optional[float],
+        non_purity_target_mode: str) -> Tuple[int, str]:
+    count = to_int(row["count"])
+    purity = to_float(row["avg_leaf_purity"])
+    if purity_ratio_threshold is not None and purity > purity_ratio_threshold:
+        target = int(round(count * float(purity_sample_ratio)))
+        return min(count, max(0, target)), "purity_ratio"
+    if non_purity_target_mode == "full":
+        return count, "full"
+    return min(count, max(0, to_int(row[target_column]))), target_column
+
+
+def build_help(row: Dict[str, str], target: int, target_source: str) -> str:
     parts = [
         "adaptive leaf split",
         f"group_key={row['group_key']}",
         f"leaf_ids={row['leaf_ids']}",
         f"count={row['count']}",
         f"suggested_target_count={target}",
+        f"target_source={target_source}",
         f"avg_leaf_purity={format_float(to_float(row['avg_leaf_purity']))}",
         f"dominant_label={row['dominant_label']}",
         f"primary_scene_top={row['primary_scene_top']}",

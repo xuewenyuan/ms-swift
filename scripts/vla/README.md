@@ -267,13 +267,21 @@ python3 scripts/vla/build_adaptive_dataset_info.py \
   --output /path/to/adaptive_leaf_dataset_info.json \
   --dataset-name-prefix vla_ego \
   --min-purity 0.7 \
-  --downsample-high-purity
+  --purity-ratio-threshold 0.9 \
+  --purity-sample-ratio 0.2 \
+  --non-purity-target-mode suggested_target_count
 ```
 
 Use the generated JSON with `--custom_dataset_info`. The companion
 `*.dataset_args.txt` contains recommended dataset arguments; with
 `--downsample-high-purity`, entries whose target is smaller than their raw count
 are written as `dataset_name#target_count`.
+If `--purity-ratio-threshold` and `--purity-sample-ratio` are set, rows whose
+`avg_leaf_purity` is greater than the threshold use `count * ratio` as their
+target count, and are written with `#target_count` automatically. Rows that do
+not match this rule use `--non-purity-target-mode`: `suggested_target_count`
+applies the manifest target column, while `full` keeps all rows without
+sampling.
 The companion `*.dataset_config.yaml` can be pasted into a `swift --config`
 YAML file so hundreds of leaf datasets do not need to be typed on the command
 line.
