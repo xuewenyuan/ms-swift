@@ -307,6 +307,16 @@ and `sampling_report.csv`. Train with the merged directory directly:
 swift sft --dataset /path/to/balanced_train --enable_channel_loss true
 ```
 
+`visualize_adaptive_purity.py` renders a static HTML dashboard for
+`adaptive_leaf_summary.csv`, including purity-bin leaf counts, row-volume
+distribution, suggested target volume, and a purity-vs-size scatter plot.
+
+```shell
+python3 scripts/vla/visualize_adaptive_purity.py \
+  --adaptive-dir /path/to/adaptive_report \
+  --output /path/to/adaptive_purity_dashboard.html
+```
+
 ## Sampling raw JSONL from bucket targets
 
 `sample_from_buckets.py` applies `sampling_buckets.csv` targets back to the
