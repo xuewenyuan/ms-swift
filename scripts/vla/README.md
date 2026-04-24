@@ -286,6 +286,27 @@ The companion `*.dataset_config.yaml` can be pasted into a `swift --config`
 YAML file so hundreds of leaf datasets do not need to be typed on the command
 line.
 
+`sample_merge_adaptive_datasets.py` applies `dataset_args.txt` offline, samples
+each leaf JSONL, and merges the selected rows into one or more shard JSONL
+files. This avoids training startup overhead from registering hundreds of leaf
+datasets while preserving the per-row `channel` field for channel loss logging.
+
+```shell
+python3 scripts/vla/sample_merge_adaptive_datasets.py \
+  --dataset-args /path/to/adaptive_leaf_dataset_info.json.dataset_args.txt \
+  --dataset-info /path/to/adaptive_leaf_dataset_info.json \
+  --output-dir /path/to/balanced_train \
+  --num-shards 16 \
+  --shuffle-datasets
+```
+
+The output directory contains `merged_00000.jsonl`, `merged_00001.jsonl`, ...
+and `sampling_report.csv`. Train with the merged directory directly:
+
+```shell
+swift sft --dataset /path/to/balanced_train --enable_channel_loss true
+```
+
 ## Sampling raw JSONL from bucket targets
 
 `sample_from_buckets.py` applies `sampling_buckets.csv` targets back to the
