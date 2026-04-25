@@ -1,6 +1,6 @@
 # Copyright (c) Alibaba, Inc. and its affiliates.
 import re
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional, Set, Tuple
 
 from swift.plugin.metric import metric_mapping
 from swift.utils import Serializer
@@ -31,6 +31,20 @@ LATERAL_DECISION_TOKENS = [
     'LAT_U_TURN',
 ]
 
+LONGITUDINAL_DECISION_NAME_TO_TOKEN = {
+    '保持': 'LON_MAINTAIN',
+    '加速': 'LON_ACCELERATE',
+    '减速': 'LON_DECELERATE',
+    '停车': 'LON_STOP',
+}
+
+LONGITUDINAL_DECISION_TOKENS = [
+    'LON_MAINTAIN',
+    'LON_ACCELERATE',
+    'LON_DECELERATE',
+    'LON_STOP',
+]
+
 
 def _decode_serialized_text(row) -> str:
     try:
@@ -48,75 +62,73 @@ def _normalize_lateral_decision(value: Optional[str]) -> Optional[str]:
     return LATERAL_DECISION_NAME_TO_TOKEN.get(value)
 
 
+def _normalize_longitudinal_decision(value: Optional[str]) -> Optional[str]:
+    if not value:
+        return None
+    value = value.strip().strip('<>').strip()
+    if value in LONGITUDINAL_DECISION_TOKENS:
+        return value
+    return LONGITUDINAL_DECISION_NAME_TO_TOKEN.get(value)
+
+
 def _extract_tokens(text: str) -> List[str]:
     return [token.strip() for token in re.findall(r'<([^<>]+)>', text or '')]
 
 
-def extract_lateral_from_response(response: str) -> Optional[str]:
+def extract_decisions_from_response(response: str) -> Tuple[Optional[str], Optional[str]]:
     if '</think>' in response:
         response = response.split('</think>', 1)[1]
 
+    lateral_decision = None
+    longitudinal_decision = None
     for token in _extract_tokens(response):
-        lateral = _normalize_lateral_decision(token)
-        if lateral is not None:
-            return lateral
-    return None
+        if lateral_decision is None:
+            lateral_decision = _normalize_lateral_decision(token)
+        if longitudinal_decision is None:
+            longitudinal_decision = _normalize_longitudinal_decision(token)
+        if lateral_decision is not None and longitudinal_decision is not None:
+            break
+    return lateral_decision, longitudinal_decision
 
 
-def extract_lateral_gt_from_labels(labels: str) -> Set[str]:
+def extract_decision_gt_from_labels(labels: str) -> Tuple[Set[str], Set[str]]:
     answer_match = re.search(r'<answer>(.*?)</answer>', labels or '', re.DOTALL)
     answer_content = answer_match.group(1) if answer_match else labels
 
-    gt_set = set()
+    lateral_gt_set = set()
+    longitudinal_gt_set = set()
     for result in answer_content.split(';'):
         tokens = _extract_tokens(result)
         if not tokens:
             continue
         lateral = _normalize_lateral_decision(tokens[0])
         if lateral is not None:
-            gt_set.add(lateral)
-    return gt_set
+            lateral_gt_set.add(lateral)
+        longitudinal = _normalize_longitudinal_decision(tokens[1] if len(tokens) >= 2 else None)
+        if longitudinal is not None:
+            longitudinal_gt_set.add(longitudinal)
+    return lateral_gt_set, longitudinal_gt_set
 
 
 def _safe_div(numerator: int, denominator: int) -> float:
     return numerator / denominator if denominator else 0.0
 
 
-def compute_lateral_decision_metrics(prediction) -> Dict[str, float]:
-    preds, labels = prediction[0], prediction[1]
-    class_counts = {
-        token: {
-            'tp': 0,
-            'fp': 0,
-            'fn': 0
-        }
-        for token in LATERAL_DECISION_TOKENS
-    }
-    total = 0
-    correct = 0
+def _init_class_counts(tokens: List[str]) -> Dict[str, Dict[str, int]]:
+    return {token: {'tp': 0, 'fp': 0, 'fn': 0} for token in tokens}
 
-    for i in range(preds.shape[0]):
-        pred_text = _decode_serialized_text(preds[i])
-        label_text = _decode_serialized_text(labels[i])
 
-        pred_lateral = extract_lateral_from_response(pred_text)
-        gt_lateral_set = extract_lateral_gt_from_labels(label_text)
-        if not gt_lateral_set:
-            continue
+def _update_class_counts(pred: Optional[str], gt_set: Set[str], class_counts: Dict[str, Dict[str, int]]) -> None:
+    for token in class_counts:
+        if pred == token and token in gt_set:
+            class_counts[token]['tp'] += 1
+        elif pred == token and token not in gt_set:
+            class_counts[token]['fp'] += 1
+        elif pred != token and token in gt_set:
+            class_counts[token]['fn'] += 1
 
-        total += 1
-        is_correct = pred_lateral in gt_lateral_set
-        correct += int(is_correct)
 
-        for token in LATERAL_DECISION_TOKENS:
-            if pred_lateral == token and token in gt_lateral_set:
-                class_counts[token]['tp'] += 1
-            elif pred_lateral == token and token not in gt_lateral_set:
-                class_counts[token]['fp'] += 1
-            elif pred_lateral != token and token in gt_lateral_set:
-                class_counts[token]['fn'] += 1
-
-    metrics = {'lateral_frame_acc': _safe_div(correct, total)}
+def _add_class_metrics(metrics: Dict[str, float], class_counts: Dict[str, Dict[str, int]]) -> None:
     for token, counts in class_counts.items():
         prefix = token.lower()
         precision = _safe_div(counts['tp'], counts['tp'] + counts['fp'])
@@ -125,7 +137,77 @@ def compute_lateral_decision_metrics(prediction) -> Dict[str, float]:
         metrics[f'{prefix}_precision'] = precision
         metrics[f'{prefix}_recall'] = recall
         metrics[f'{prefix}_f1'] = f1
+
+
+def _compute_decision_metrics(prediction, *, dimension: str, full: bool) -> Dict[str, float]:
+    preds, labels = prediction[0], prediction[1]
+    if dimension == 'lateral':
+        tokens = LATERAL_DECISION_TOKENS
+        metric_prefix = 'lateral'
+    elif dimension == 'longitudinal':
+        tokens = LONGITUDINAL_DECISION_TOKENS
+        metric_prefix = 'longitudinal'
+    else:
+        raise ValueError(f'Unsupported decision dimension: {dimension}')
+
+    class_counts = _init_class_counts(tokens)
+    total = 0
+    correct = 0
+
+    for i in range(preds.shape[0]):
+        pred_text = _decode_serialized_text(preds[i])
+        label_text = _decode_serialized_text(labels[i])
+
+        pred_lateral, pred_longitudinal = extract_decisions_from_response(pred_text)
+        gt_lateral_set, gt_longitudinal_set = extract_decision_gt_from_labels(label_text)
+        if dimension == 'lateral':
+            pred_decision = pred_lateral
+            gt_set = gt_lateral_set
+        else:
+            pred_decision = pred_longitudinal
+            gt_set = gt_longitudinal_set
+
+        if not gt_set:
+            continue
+
+        total += 1
+        correct += int(pred_decision in gt_set)
+        if full:
+            _update_class_counts(pred_decision, gt_set, class_counts)
+
+    metrics = {f'{metric_prefix}_frame_acc': _safe_div(correct, total)}
+    if full:
+        _add_class_metrics(metrics, class_counts)
     return metrics
 
 
+def compute_lateral_decision_simple_metrics(prediction) -> Dict[str, float]:
+    return _compute_decision_metrics(prediction, dimension='lateral', full=False)
+
+
+def compute_lateral_decision_full_metrics(prediction) -> Dict[str, float]:
+    return _compute_decision_metrics(prediction, dimension='lateral', full=True)
+
+
+def compute_longitudinal_decision_simple_metrics(prediction) -> Dict[str, float]:
+    return _compute_decision_metrics(prediction, dimension='longitudinal', full=False)
+
+
+def compute_longitudinal_decision_full_metrics(prediction) -> Dict[str, float]:
+    return _compute_decision_metrics(prediction, dimension='longitudinal', full=True)
+
+
+def compute_lateral_decision_metrics(prediction) -> Dict[str, float]:
+    return compute_lateral_decision_full_metrics(prediction)
+
+
+def compute_longitudinal_decision_metrics(prediction) -> Dict[str, float]:
+    return compute_longitudinal_decision_full_metrics(prediction)
+
+
+metric_mapping['lateral_decision_simple'] = (compute_lateral_decision_simple_metrics, None)
+metric_mapping['lateral_decision_full'] = (compute_lateral_decision_full_metrics, None)
 metric_mapping['lateral_decision'] = (compute_lateral_decision_metrics, None)
+metric_mapping['longitudinal_decision_simple'] = (compute_longitudinal_decision_simple_metrics, None)
+metric_mapping['longitudinal_decision_full'] = (compute_longitudinal_decision_full_metrics, None)
+metric_mapping['longitudinal_decision'] = (compute_longitudinal_decision_metrics, None)
