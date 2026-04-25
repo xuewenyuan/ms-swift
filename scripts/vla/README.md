@@ -50,6 +50,56 @@ These matrices are not meant to replace real VLM embeddings. For production
 clustering, append real visual/text/fused embeddings as additional `N x D`
 `float32` `.npy` files with the same row order, and add them to `manifest.json`.
 
+## Swift last-hidden-state dump
+
+`dump_hidden_state_features.py` uses swift model/template loading to run the
+model forward pass and dump pooled last-layer hidden states as a FAISS-friendly
+matrix. It keeps the same `manifest.json`, `meta.jsonl`, `index.jsonl`, and
+`sample_ids.txt` layout as `dump_messages_features.py`, so downstream clustering
+can consume it directly.
+
+```shell
+python3 scripts/vla/dump_hidden_state_features.py \
+  --input /path/to/train_jsonl_dir_or_file \
+  --output-dir /path/to/hidden_feature_dump \
+  --message-scope prompt \
+  --pooling mean \
+  --batch-size 1 \
+  --model /path/to/model \
+  --template qwen2_5_vl
+```
+
+The default `--message-scope prompt` removes assistant responses before encoding,
+which avoids leaking the lateral/longitudinal labels into the clustering
+features. Use `--message-scope full` only when you explicitly want the assistant
+decision tokens included. The output matrix name is `llm_last_hidden` by
+default:
+
+```shell
+python3 scripts/vla/adaptive_cluster_mining.py \
+  --feature-dir /path/to/hidden_feature_dump \
+  --output-dir /path/to/adaptive_report_hidden \
+  --matrix llm_last_hidden \
+  --scene-map /path/to/scene_map.json
+```
+
+For cloud distributed runs, launch one process per GPU. Each process writes a
+rank shard under `output-dir/shards/`, and the existing clustering loader will
+merge shards by original `row_idx`:
+
+```shell
+NPROC_PER_NODE=8 \
+python3 -m torch.distributed.run \
+  --nproc_per_node 8 \
+  scripts/vla/dump_hidden_state_features.py \
+  --input /path/to/train_jsonl_dir_or_file \
+  --output-dir /path/to/hidden_feature_dump \
+  --distributed \
+  --batch-size 1 \
+  --model /path/to/model \
+  --template qwen2_5_vl
+```
+
 ## FAISS usage sketch
 
 ```python
