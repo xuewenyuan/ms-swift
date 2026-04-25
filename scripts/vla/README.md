@@ -317,6 +317,28 @@ python3 scripts/vla/visualize_adaptive_purity.py \
   --output /path/to/adaptive_purity_dashboard.html
 ```
 
+`compare_adaptive_reports.py` compares two adaptive report directories and
+summarizes whether relabeled data became cleaner overall, by decision label, and
+by primary scene.
+
+```shell
+python3 scripts/vla/compare_adaptive_reports.py \
+  --old-report /path/to/adaptive_report_old \
+  --new-report /path/to/adaptive_report_new \
+  --output-dir /path/to/adaptive_compare
+```
+
+The output directory contains:
+
+```text
+adaptive_compare/
+  compare_overview.csv
+  compare_label_metrics.csv
+  compare_primary_scene_metrics.csv
+  compare_summary.json
+  compare_summary.md
+```
+
 ## Sampling raw JSONL from bucket targets
 
 `sample_from_buckets.py` applies `sampling_buckets.csv` targets back to the
