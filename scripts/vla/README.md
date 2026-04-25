@@ -339,6 +339,34 @@ adaptive_compare/
   compare_summary.md
 ```
 
+`analyze_channel_loss_purity.py` joins training channel-loss curves with
+adaptive leaf purity to check whether convergence is correlated with cluster
+purity. It can read TensorBoard event files directly, or a scalar CSV exported
+from TensorBoard.
+
+```shell
+python3 scripts/vla/analyze_channel_loss_purity.py \
+  --tb-dir /path/to/train_output/runs \
+  --split-manifest /path/to/adaptive_leaf_jsonl/split_manifest.csv \
+  --channel-prefix vla_ego \
+  --output-dir /path/to/channel_loss_purity
+```
+
+The output directory contains per-channel convergence metrics, purity/loss
+correlations, purity-bin trends, unmatched TensorBoard tags, a Markdown summary,
+and a static HTML dashboard. For hundreds of leaves, the purity-bin trend charts
+are usually easier to read than the raw scatter plots.
+
+```text
+channel_loss_purity/
+  channel_loss_metrics.csv
+  channel_loss_correlations.csv
+  channel_loss_purity_bins.csv
+  channel_loss_unmatched.csv
+  channel_loss_purity_summary.md
+  channel_loss_purity_dashboard.html
+```
+
 ## Sampling raw JSONL from bucket targets
 
 `sample_from_buckets.py` applies `sampling_buckets.csv` targets back to the
