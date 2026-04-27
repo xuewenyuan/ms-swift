@@ -357,6 +357,32 @@ and `sampling_report.csv`. Train with the merged directory directly:
 swift sft --dataset /path/to/balanced_train --enable_channel_loss true
 ```
 
+`sample_adaptive_experiments.py` builds experiment datasets directly from
+adaptive leaf JSONL files and `split_manifest.csv`. It can produce the three
+sampling plans discussed for VLA decision training:
+
+- `A_high_purity_dedup`: purity >= 0.9 keeps 30%, 0.7 <= purity < 0.9 keeps
+  50%, lower-purity leaves keep all rows.
+- `B_remove_roundabout_dirty`: applies A, then removes low-purity leaves that
+  are dominated by roundabout prompts or review-first leaves whose secondary
+  scene matches roundabout keywords.
+- `C_balanced_decision`: applies roundabout dirty removal, down-samples
+  high-purity/high-frequency labels, keeps or lightly up-samples low-purity
+  non-roundabout leaves, and up-samples low-frequency decision labels.
+
+```shell
+python3 scripts/vla/sample_adaptive_experiments.py \
+  --split-manifest /path/to/adaptive_leaf_jsonl/split_manifest.csv \
+  --output-dir /path/to/adaptive_sampling_experiments \
+  --strategies A,B,C \
+  --num-shards 16 \
+  --write-holdout
+```
+
+Each strategy directory contains sampled JSONL shards, `sampling_plan.csv`, and
+`sampling_summary.json`. The holdout shards keep removed dirty roundabout leaves
+for review or future roundabout-specific training.
+
 `visualize_adaptive_purity.py` renders a static HTML dashboard for
 `adaptive_leaf_summary.csv`, including purity-bin leaf counts, row-volume
 distribution, suggested target volume, and a purity-vs-size scatter plot.
