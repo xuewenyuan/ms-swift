@@ -50,6 +50,38 @@ These matrices are not meant to replace real VLM embeddings. For production
 clustering, append real visual/text/fused embeddings as additional `N x D`
 `float32` `.npy` files with the same row order, and add them to `manifest.json`.
 
+## CoC template analysis
+
+`analyze_coc_templates.py` evaluates Chain-of-Causation / COT text wrapped by
+`<think>...</think>` in assistant messages. It is independent from feature dump
+and clustering reports, and can be run directly on a JSONL file or directory.
+
+```shell
+python3 scripts/vla/analyze_coc_templates.py \
+  --input /path/to/coc_jsonl_dir_or_file \
+  --output-dir /path/to/coc_template_report \
+  --scene-map /path/to/scene_map.json
+```
+
+The report includes exact and normalized duplicate coverage, top normalized
+templates, per-sample template scores, CoC length bins, and high-score review
+candidates:
+
+```text
+coc_template_report/
+  coc_summary.json
+  coc_summary.md
+  coc_sample_scores.csv
+  coc_top_normalized_templates.csv
+  coc_top_exact_templates.csv
+  coc_length_bins.csv
+  coc_review_candidates.jsonl
+```
+
+Normalization replaces dates, times, numbers, units, URLs, and special tokens
+before duplicate counting, so repeated templates with different distances or
+speeds can still be detected.
+
 ## Swift last-hidden-state dump
 
 `dump_hidden_state_features.py` uses swift model/template loading to run the
