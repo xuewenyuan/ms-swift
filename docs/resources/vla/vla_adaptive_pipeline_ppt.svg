@@ -1,0 +1,183 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="900" viewBox="0 0 1600 900" role="img" aria-labelledby="title desc">
+  <title id="title">VLA feature dump and adaptive clustering pipeline</title>
+  <desc id="desc">A presentation-ready framework diagram for feature dumping, adaptive clustering, leaf sampling, training, and feedback.</desc>
+  <defs>
+    <style>
+      .bg { fill: #f7f8fb; }
+      .title { font: 700 42px Arial, "PingFang SC", "Microsoft YaHei", sans-serif; fill: #172033; }
+      .subtitle { font: 400 22px Arial, "PingFang SC", "Microsoft YaHei", sans-serif; fill: #556173; }
+      .section-title { font: 700 22px Arial, "PingFang SC", "Microsoft YaHei", sans-serif; fill: #ffffff; }
+      .card-title { font: 700 22px Arial, "PingFang SC", "Microsoft YaHei", sans-serif; fill: #172033; }
+      .card-text { font: 400 17px Arial, "PingFang SC", "Microsoft YaHei", sans-serif; fill: #4b5668; }
+      .small { font: 400 15px Arial, "PingFang SC", "Microsoft YaHei", sans-serif; fill: #5f6b7d; }
+      .tag { font: 700 14px Arial, "PingFang SC", "Microsoft YaHei", sans-serif; fill: #ffffff; letter-spacing: .6px; }
+      .note-title { font: 700 19px Arial, "PingFang SC", "Microsoft YaHei", sans-serif; fill: #172033; }
+      .note-text { font: 400 16px Arial, "PingFang SC", "Microsoft YaHei", sans-serif; fill: #4b5668; }
+      .shadow { filter: url(#shadow); }
+      .arrow { stroke: #8090a5; stroke-width: 3.5; fill: none; marker-end: url(#arrow); stroke-linecap: round; stroke-linejoin: round; }
+      .loop { stroke: #b15f36; stroke-width: 3; fill: none; marker-end: url(#arrow-warm); stroke-linecap: round; stroke-linejoin: round; stroke-dasharray: 10 8; }
+      .thin { stroke: #c6ceda; stroke-width: 2; fill: none; stroke-linecap: round; }
+      .card { fill: #ffffff; stroke: #d7dde8; stroke-width: 1.4; rx: 18; }
+      .soft-card { fill: #ffffff; stroke: #e2e6ee; stroke-width: 1.2; rx: 16; }
+    </style>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="10" stdDeviation="12" flood-color="#172033" flood-opacity="0.12"/>
+    </filter>
+    <marker id="arrow" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="9" markerHeight="9" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#8090a5"/>
+    </marker>
+    <marker id="arrow-warm" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="9" markerHeight="9" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#b15f36"/>
+    </marker>
+    <linearGradient id="g-input" x1="0" x2="1">
+      <stop offset="0%" stop-color="#2f6f73"/>
+      <stop offset="100%" stop-color="#3b8a7a"/>
+    </linearGradient>
+    <linearGradient id="g-feature" x1="0" x2="1">
+      <stop offset="0%" stop-color="#3467a6"/>
+      <stop offset="100%" stop-color="#4a80bc"/>
+    </linearGradient>
+    <linearGradient id="g-cluster" x1="0" x2="1">
+      <stop offset="0%" stop-color="#6f5aa8"/>
+      <stop offset="100%" stop-color="#8a6fc2"/>
+    </linearGradient>
+    <linearGradient id="g-sample" x1="0" x2="1">
+      <stop offset="0%" stop-color="#b6673d"/>
+      <stop offset="100%" stop-color="#d1844c"/>
+    </linearGradient>
+    <linearGradient id="g-train" x1="0" x2="1">
+      <stop offset="0%" stop-color="#4f6f3b"/>
+      <stop offset="100%" stop-color="#6f8d48"/>
+    </linearGradient>
+  </defs>
+
+  <rect class="bg" width="1600" height="900"/>
+
+  <text class="title" x="76" y="82">VLA 数据挖掘闭环：Pre-LLM Feature → 聚类 → 采样训练</text>
+  <text class="subtitle" x="78" y="120">目标：基于输入 LLM 前的视觉 / 文本特征聚类，做数据配比和多样性覆盖，再定位疑似标注问题</text>
+
+  <g transform="translate(70,170)">
+    <rect x="0" y="0" width="260" height="560" rx="22" fill="#e7f0ef"/>
+    <rect x="0" y="0" width="260" height="56" rx="22" fill="url(#g-input)"/>
+    <text class="section-title" x="28" y="36">1. 原始数据</text>
+    <g class="shadow">
+      <rect class="card" x="28" y="96" width="204" height="154"/>
+      <text class="card-title" x="52" y="134">jsonl 样本</text>
+      <text class="card-text" x="52" y="174">messages</text>
+      <text class="card-text" x="52" y="204">scene_id / 标签</text>
+      <text class="card-text" x="52" y="234">sample_token / time</text>
+    </g>
+    <g>
+      <rect class="soft-card" x="28" y="298" width="204" height="138"/>
+      <text class="note-title" x="52" y="334">监督信号</text>
+      <text class="note-text" x="52" y="368">横向决策</text>
+      <text class="note-text" x="52" y="398">纵向决策</text>
+    </g>
+    <rect x="32" y="488" width="196" height="34" rx="17" fill="#2f6f73"/>
+    <text class="tag" x="61" y="511">RAW DATA</text>
+  </g>
+
+  <g transform="translate(360,170)">
+    <rect x="0" y="0" width="280" height="560" rx="22" fill="#e9f0f8"/>
+    <rect x="0" y="0" width="280" height="56" rx="22" fill="url(#g-feature)"/>
+    <text class="section-title" x="28" y="36">2. Pre-LLM 特征</text>
+    <g class="shadow">
+      <rect class="card" x="28" y="84" width="224" height="130"/>
+      <text class="card-title" x="52" y="120">视觉特征</text>
+      <text class="card-text" x="52" y="160">video / image encoder</text>
+      <text class="small" x="52" y="190">输入 LLM 前 visual tokens</text>
+    </g>
+    <g class="shadow">
+      <rect class="card" x="28" y="248" width="224" height="130"/>
+      <text class="card-title" x="52" y="284">文本特征</text>
+      <text class="card-text" x="52" y="324">ego_state prompt</text>
+      <text class="small" x="52" y="354">输入 LLM 前 text tokens</text>
+    </g>
+    <g>
+      <rect class="soft-card" x="28" y="426" width="224" height="82"/>
+      <text class="note-title" x="52" y="460">输出</text>
+      <text class="note-text" x="52" y="492">vision / text / fused matrix</text>
+    </g>
+  </g>
+
+  <g transform="translate(670,170)">
+    <rect x="0" y="0" width="300" height="560" rx="22" fill="#eeeaf7"/>
+    <rect x="0" y="0" width="300" height="56" rx="22" fill="url(#g-cluster)"/>
+    <text class="section-title" x="28" y="36">3. 自适应聚类</text>
+    <g class="shadow">
+      <rect class="card" x="30" y="86" width="240" height="128"/>
+      <text class="card-title" x="56" y="122">FAISS 聚类</text>
+      <text class="card-text" x="56" y="162">按 leaf 递归切分</text>
+      <text class="small" x="56" y="192">adaptive_cluster_mining.py</text>
+    </g>
+    <path class="thin" d="M150 232 C95 255 95 305 150 328 C205 305 205 255 150 232"/>
+    <text class="note-title" x="95" y="278">purity 达标？</text>
+    <text class="small" x="112" y="304">是：停止</text>
+    <text class="small" x="112" y="326">否：继续</text>
+    <g>
+      <rect class="soft-card" x="30" y="372" width="240" height="118"/>
+      <text class="note-title" x="56" y="406">聚类报告</text>
+      <text class="note-text" x="56" y="438">leaf purity / dominant label</text>
+      <text class="note-text" x="56" y="468">scene 分布 / 难例候选</text>
+    </g>
+  </g>
+
+  <g transform="translate(1000,170)">
+    <rect x="0" y="0" width="300" height="560" rx="22" fill="#f8eee8"/>
+    <rect x="0" y="0" width="300" height="56" rx="22" fill="url(#g-sample)"/>
+    <text class="section-title" x="28" y="36">4. 采样实验</text>
+    <g class="shadow">
+      <rect class="card" x="30" y="84" width="240" height="118"/>
+      <text class="card-title" x="56" y="120">A 高纯去冗余</text>
+      <text class="card-text" x="56" y="158">0.9+ 保留 20%-30%</text>
+      <text class="card-text" x="56" y="184">0.7-0.9 保留 50%</text>
+    </g>
+    <g class="shadow">
+      <rect class="card" x="30" y="228" width="240" height="116"/>
+      <text class="card-title" x="56" y="264">B 环岛 holdout</text>
+      <text class="card-text" x="56" y="302">删除低纯环岛脏簇</text>
+      <text class="card-text" x="56" y="328">或进入 review set</text>
+    </g>
+    <g class="shadow">
+      <rect class="card" x="30" y="370" width="240" height="126"/>
+      <text class="card-title" x="56" y="406">C 标签联合采样</text>
+      <text class="card-text" x="56" y="444">高频下采样</text>
+      <text class="card-text" x="56" y="472">低频上采样</text>
+    </g>
+  </g>
+
+  <g transform="translate(1330,170)">
+    <rect x="0" y="0" width="200" height="560" rx="22" fill="#ecf2e8"/>
+    <rect x="0" y="0" width="200" height="56" rx="22" fill="url(#g-train)"/>
+    <text class="section-title" x="28" y="36">5. 训练反馈</text>
+    <g class="shadow">
+      <rect class="card" x="24" y="96" width="152" height="126"/>
+      <text class="card-title" x="50" y="132">SFT</text>
+      <text class="card-text" x="50" y="170">ms-swift</text>
+      <text class="card-text" x="50" y="200">采样数据</text>
+    </g>
+    <g>
+      <rect class="soft-card" x="24" y="270" width="152" height="146"/>
+      <text class="note-title" x="50" y="306">诊断</text>
+      <text class="note-text" x="50" y="340">channel loss</text>
+      <text class="note-text" x="50" y="370">leaf loss</text>
+      <text class="note-text" x="50" y="400">人工复核</text>
+    </g>
+    <rect x="24" y="468" width="152" height="34" rx="17" fill="#4f6f3b"/>
+    <text class="tag" x="45" y="491">FEEDBACK</text>
+  </g>
+
+  <path class="arrow" d="M330 450 L354 450"/>
+  <path class="arrow" d="M640 450 L664 450"/>
+  <path class="arrow" d="M970 450 L994 450"/>
+  <path class="arrow" d="M1300 450 L1324 450"/>
+
+  <g transform="translate(82,775)">
+    <rect x="0" y="0" width="1448" height="62" rx="20" fill="#ffffff" stroke="#dfe5ef" stroke-width="1.4"/>
+    <text class="note-title" x="30" y="38">核心闭环：</text>
+    <text class="note-text" x="128" y="38">采样配比提升训练效率，多样性覆盖保护长尾；低纯簇、高 loss 簇、环岛 holdout 进入人工复核或专项训练。</text>
+  </g>
+
+  <path class="loop" d="M1430 730 C1420 842 260 856 204 738"/>
+  <text class="small" x="630" y="858" fill="#b15f36">重新标注 / 调整采样 / 重新聚类</text>
+</svg>
