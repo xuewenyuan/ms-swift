@@ -390,8 +390,8 @@ swift sft --dataset /path/to/balanced_train --enable_channel_loss true
 ```
 
 `sample_adaptive_experiments.py` builds experiment datasets directly from
-adaptive leaf JSONL files and `split_manifest.csv`. It can produce the three
-sampling plans discussed for VLA decision training:
+adaptive leaf JSONL files and `split_manifest.csv`. It can produce the sampling
+plans discussed for VLA decision training:
 
 - `A_high_purity_dedup`: purity >= 0.9 keeps 30%, 0.7 <= purity < 0.9 keeps
   50%, lower-purity leaves keep all rows.
@@ -401,6 +401,12 @@ sampling plans discussed for VLA decision training:
 - `C_balanced_decision`: applies roundabout dirty removal, down-samples
   high-purity/high-frequency labels, keeps or lightly up-samples low-purity
   non-roundabout leaves, and up-samples low-frequency decision labels.
+- `D_aggressive_purity_label_sampling`: applies the same roundabout dirty
+  removal as B, then samples by decision label inside each leaf. For
+  purity >= 0.7, the dominant label keeps 10% while non-dominant labels are kept. For
+  0.4 <= purity < 0.7, labels with ratio p >= 10% keep 0.1 / p, labels below
+  100 rows are up-sampled to 100, and lower-ratio labels are kept. Purity < 0.4
+  leaves are kept unchanged.
 
 ```shell
 python3 scripts/vla/sample_adaptive_experiments.py \
@@ -414,6 +420,22 @@ python3 scripts/vla/sample_adaptive_experiments.py \
 Each strategy directory contains sampled JSONL shards, `sampling_plan.csv`, and
 `sampling_summary.json`. The holdout shards keep removed dirty roundabout leaves
 for review or future roundabout-specific training.
+
+Run the aggressive label-aware plan with:
+
+```shell
+python3 scripts/vla/sample_adaptive_experiments.py \
+  --split-manifest /path/to/adaptive_leaf_jsonl/split_manifest.csv \
+  --output-dir /path/to/adaptive_sampling_experiments \
+  --strategies D \
+  --num-shards 16 \
+  --write-holdout
+```
+
+The D strategy additionally writes `label_sampling_plan.csv`, which records the
+target count and reason for every `(leaf, decision label)` group. Dirty
+roundabout leaves are always removed from sampled shards; `--write-holdout`
+only controls whether those removed leaves are also written to holdout shards.
 
 `visualize_adaptive_purity.py` renders a static HTML dashboard for
 `adaptive_leaf_summary.csv`, including purity-bin leaf counts, row-volume

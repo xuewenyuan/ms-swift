@@ -4,12 +4,11 @@
 import argparse
 import csv
 import json
-import math
 import random
 import re
-from collections import Counter
+from collections import Counter, defaultdict
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, DefaultDict, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from analyze_cluster_mining import UNKNOWN, safe_div, split_label, write_csv
 from dump_messages_features import parse_vla_output, split_input_output
@@ -18,11 +17,12 @@ from dump_messages_features import parse_vla_output, split_input_output
 STRATEGY_A = "A_high_purity_dedup"
 STRATEGY_B = "B_remove_roundabout_dirty"
 STRATEGY_C = "C_balanced_decision"
+STRATEGY_D = "D_aggressive_purity_label_sampling"
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Sample adaptive leaf JSONL files into A/B/C training datasets.")
+        description="Sample adaptive leaf JSONL files into A/B/C/D training datasets.")
     parser.add_argument(
         "--split-manifest",
         required=True,
@@ -31,9 +31,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--strategies",
         default="A,B,C",
-        help="Comma-separated strategies to build: A,B,C. Default: A,B,C.")
+        help="Comma-separated strategies to build: A,B,C,D. Default: A,B,C.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed. Default: 42.")
-    parser.add_argument("--num-shards", type=int, default=8, help="Number of output shards per strategy. Default: 16.")
+    parser.add_argument("--num-shards", type=int, default=8, help="Number of output shards per strategy. Default: 8.")
     parser.add_argument("--output-prefix", default="sampled", help="Output shard filename prefix. Default: sampled.")
     parser.add_argument(
         "--upsample-mode",
@@ -84,7 +84,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--write-holdout",
         action="store_true",
-        help="Write removed dirty roundabout leaves to holdout JSONL shards for B/C.")
+        help="Write removed dirty roundabout leaves to holdout JSONL shards for B/C/D.")
 
     parser.add_argument(
         "--high-label-count",
@@ -116,6 +116,31 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=3.0,
         help="C cap for low-frequency upsampling ratio. Default: 3.0.")
+    parser.add_argument(
+        "--d-high-purity-threshold",
+        type=float,
+        default=0.7,
+        help="D treats leaves with purity >= this as high-purity. Default: 0.7.")
+    parser.add_argument(
+        "--d-mid-purity-low",
+        type=float,
+        default=0.4,
+        help="D treats leaves with this <= purity < high threshold as mid-purity. Default: 0.4.")
+    parser.add_argument(
+        "--d-dominant-label-ratio",
+        type=float,
+        default=0.1,
+        help="D keep ratio for the dominant label in high-purity leaves. Default: 0.1.")
+    parser.add_argument(
+        "--d-mid-label-target-share",
+        type=float,
+        default=0.1,
+        help="D target share for labels whose ratio in a mid-purity leaf is at least this value. Default: 0.1.")
+    parser.add_argument(
+        "--d-min-label-target-count",
+        type=int,
+        default=100,
+        help="D up-samples labels below this count in mid-purity leaves. Default: 100.")
     return parser
 
 
@@ -136,10 +161,17 @@ def main() -> None:
     for strategy in strategies:
         strategy_dir = output_dir / strategy
         strategy_dir.mkdir(parents=True, exist_ok=True)
-        plan_rows, total_target = build_strategy_plan(strategy, leaf_stats, label_counts, args)
-        write_csv(strategy_dir / "sampling_plan.csv", plan_rows)
-        write_strategy_dataset(strategy, strategy_dir, plan_rows, args, rng)
-        summary = build_summary(strategy, plan_rows, total_target, label_counts, args)
+        if strategy == STRATEGY_D:
+            plan_rows, label_plan_rows, total_target = build_strategy_d_plans(leaf_stats, label_counts, args)
+            write_csv(strategy_dir / "sampling_plan.csv", plan_rows)
+            write_csv(strategy_dir / "label_sampling_plan.csv", label_plan_rows)
+            write_strategy_d_dataset(strategy, strategy_dir, label_plan_rows, args, rng)
+            summary = build_summary(strategy, plan_rows, total_target, label_counts, args, label_plan_rows)
+        else:
+            plan_rows, total_target = build_strategy_plan(strategy, leaf_stats, label_counts, args)
+            write_csv(strategy_dir / "sampling_plan.csv", plan_rows)
+            write_strategy_dataset(strategy, strategy_dir, plan_rows, args, rng)
+            summary = build_summary(strategy, plan_rows, total_target, label_counts, args)
         (strategy_dir / "sampling_summary.json").write_text(
             json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         print(f"{strategy}: target={total_target}, groups={len(plan_rows)} -> {strategy_dir}")
@@ -155,10 +187,20 @@ def validate_args(args: argparse.Namespace) -> None:
             "mid_purity_mid_frequency_ratio",
             "low_label_upsample_ratio",
             "max_low_label_upsample_ratio",
+            "d_high_purity_threshold",
+            "d_mid_purity_low",
+            "d_dominant_label_ratio",
+            "d_mid_label_target_share",
     ]:
         value = float(getattr(args, name))
         if value < 0:
             raise ValueError(f"--{name.replace('_', '-')} must be non-negative")
+    if args.d_mid_purity_low > args.d_high_purity_threshold:
+        raise ValueError("--d-mid-purity-low should be <= --d-high-purity-threshold")
+    if args.d_mid_label_target_share <= 0:
+        raise ValueError("--d-mid-label-target-share must be positive")
+    if args.d_min_label_target_count < 0:
+        raise ValueError("--d-min-label-target-count must be non-negative")
     if args.low_label_count > args.high_label_count:
         raise ValueError("--low-label-count should be <= --high-label-count")
     if args.num_shards <= 0:
@@ -166,14 +208,14 @@ def validate_args(args: argparse.Namespace) -> None:
 
 
 def parse_strategies(value: str) -> List[str]:
-    mapping = {"A": STRATEGY_A, "B": STRATEGY_B, "C": STRATEGY_C}
+    mapping = {"A": STRATEGY_A, "B": STRATEGY_B, "C": STRATEGY_C, "D": STRATEGY_D}
     strategies = []
     for item in value.split(","):
         item = item.strip()
         if not item:
             continue
         if item not in mapping:
-            raise ValueError(f"unknown strategy {item}; choose from A,B,C")
+            raise ValueError(f"unknown strategy {item}; choose from A,B,C,D")
         strategies.append(mapping[item])
     if not strategies:
         raise ValueError("no strategies selected")
@@ -321,6 +363,190 @@ def target_ratio(
     raise ValueError(f"unsupported strategy: {strategy}")
 
 
+def build_strategy_d_plans(
+        leaf_stats: Sequence[Dict[str, Any]],
+        label_counts: Counter,
+        args: argparse.Namespace) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], int]:
+    label_plan_rows = []
+    leaf_plan_rows = []
+    total_target = 0
+    for row in leaf_stats:
+        leaf_label_rows = build_strategy_d_leaf_label_rows(row, label_counts, args)
+        label_plan_rows.extend(leaf_label_rows)
+        leaf_target = sum(int(item["target"]) for item in leaf_label_rows if item["action"] != "holdout_dirty_roundabout")
+        if leaf_label_rows and leaf_label_rows[0]["action"] == "holdout_dirty_roundabout":
+            leaf_action = "holdout_dirty_roundabout"
+            leaf_reason = leaf_label_rows[0]["reason"]
+            total_target += 0
+        else:
+            leaf_action = strategy_d_leaf_action(float(row["purity"]), args)
+            leaf_reason = strategy_d_leaf_reason(float(row["purity"]), args)
+            total_target += leaf_target
+        available = int(row["available"])
+        dominant_label = row["scanned_dominant_label"]
+        leaf_plan_rows.append({
+            "strategy": STRATEGY_D,
+            "group_key": row.get("group_key", ""),
+            "file": row["file"],
+            "available": available,
+            "target": leaf_target,
+            "sample_ratio": safe_div(leaf_target, available),
+            "action": leaf_action,
+            "reason": leaf_reason,
+            "purity": row["purity"],
+            "roundabout_count": row["roundabout_count"],
+            "roundabout_ratio": row["roundabout_ratio"],
+            "dominant_label": dominant_label,
+            "dominant_label_count_in_leaf": row["scanned_dominant_label_count"],
+            "dominant_label_ratio_in_leaf": row["scanned_dominant_label_ratio"],
+            "label_count_global": label_counts[dominant_label],
+            "label_frequency_bucket": label_frequency_bucket(label_counts[dominant_label], args),
+            "secondary_scene_top": row.get("secondary_scene_top", ""),
+            "suggested_action_top": row.get("suggested_action_top", ""),
+            "stop_reason_top": row.get("stop_reason_top", ""),
+            "leaf_ids": row.get("leaf_ids", ""),
+            "num_label_groups": len([item for item in leaf_label_rows if item["action"] != "holdout_dirty_roundabout"]),
+        })
+    return leaf_plan_rows, label_plan_rows, total_target
+
+
+def build_strategy_d_leaf_label_rows(
+        row: Dict[str, Any],
+        label_counts: Counter,
+        args: argparse.Namespace) -> List[Dict[str, Any]]:
+    dirty, dirty_reason = is_dirty_roundabout_leaf(row, args)
+    available = int(row["available"])
+    purity = float(row["purity"])
+    dominant_label = str(row["scanned_dominant_label"])
+    if dirty:
+        return [
+            strategy_d_label_row(
+                row,
+                label_counts,
+                label="__ALL__",
+                label_count=available,
+                target=0,
+                action="holdout_dirty_roundabout",
+                reason=dirty_reason,
+                args=args,
+            )
+        ]
+
+    label_rows = []
+    for label, label_count in sorted(row["label_counts"].items(), key=lambda item: (-item[1], str(item[0]))):
+        target, action, reason = strategy_d_label_target(
+            purity=purity,
+            available=available,
+            label=str(label),
+            label_count=int(label_count),
+            dominant_label=dominant_label,
+            args=args,
+        )
+        label_rows.append(strategy_d_label_row(row, label_counts, str(label), int(label_count), target, action, reason,
+                                              args))
+    return label_rows
+
+
+def strategy_d_label_target(
+        *,
+        purity: float,
+        available: int,
+        label: str,
+        label_count: int,
+        dominant_label: str,
+        args: argparse.Namespace) -> Tuple[int, str, str]:
+    label_ratio = safe_div(label_count, available)
+    if purity >= args.d_high_purity_threshold:
+        if label == dominant_label:
+            target = proportional_target(label_count, args.d_dominant_label_ratio)
+            return target, "downsample_high_purity_dominant_label", (
+                f"purity>={args.d_high_purity_threshold}, dominant_label, "
+                f"keep_ratio={args.d_dominant_label_ratio}")
+        return label_count, "keep_high_purity_non_dominant_label", (
+            f"purity>={args.d_high_purity_threshold}, non-dominant label")
+
+    if args.d_mid_purity_low <= purity < args.d_high_purity_threshold:
+        if label_count < args.d_min_label_target_count:
+            return args.d_min_label_target_count, "upsample_mid_purity_small_label", (
+                f"{args.d_mid_purity_low}<=purity<{args.d_high_purity_threshold}, "
+                f"label_count={label_count}<min_label_target_count={args.d_min_label_target_count}")
+        if label_ratio >= args.d_mid_label_target_share:
+            keep_ratio = args.d_mid_label_target_share / label_ratio
+            target = proportional_target(label_count, keep_ratio)
+            return target, "downsample_mid_purity_frequent_label", (
+                f"{args.d_mid_purity_low}<=purity<{args.d_high_purity_threshold}, "
+                f"label_ratio={label_ratio:.6f}>={args.d_mid_label_target_share}, keep_ratio={keep_ratio:.6f}")
+        return label_count, "keep_mid_purity_tail_label", (
+            f"{args.d_mid_purity_low}<=purity<{args.d_high_purity_threshold}, "
+            f"label_ratio={label_ratio:.6f}<{args.d_mid_label_target_share}")
+
+    return label_count, "keep_low_purity_label", f"purity<{args.d_mid_purity_low}"
+
+
+def strategy_d_label_row(
+        row: Dict[str, Any],
+        label_counts: Counter,
+        label: str,
+        label_count: int,
+        target: int,
+        action: str,
+        reason: str,
+        args: argparse.Namespace) -> Dict[str, Any]:
+    available = int(row["available"])
+    label_ratio = safe_div(label_count, available)
+    dominant_label = str(row["scanned_dominant_label"])
+    return {
+        "strategy": STRATEGY_D,
+        "group_key": row.get("group_key", ""),
+        "file": row["file"],
+        "label": label,
+        "label_count_in_leaf": label_count,
+        "label_ratio_in_leaf": label_ratio,
+        "target": target,
+        "sample_ratio": safe_div(target, label_count),
+        "action": action,
+        "reason": reason,
+        "purity": row["purity"],
+        "available": available,
+        "is_dominant_label": label == dominant_label,
+        "dominant_label": dominant_label,
+        "dominant_label_count_in_leaf": row["scanned_dominant_label_count"],
+        "dominant_label_ratio_in_leaf": row["scanned_dominant_label_ratio"],
+        "label_count_global": label_counts[label] if label != "__ALL__" else "",
+        "label_frequency_bucket": label_frequency_bucket(label_counts[label], args) if label != "__ALL__" else "",
+        "roundabout_count": row["roundabout_count"],
+        "roundabout_ratio": row["roundabout_ratio"],
+        "secondary_scene_top": row.get("secondary_scene_top", ""),
+        "suggested_action_top": row.get("suggested_action_top", ""),
+        "stop_reason_top": row.get("stop_reason_top", ""),
+        "leaf_ids": row.get("leaf_ids", ""),
+    }
+
+
+def strategy_d_leaf_action(purity: float, args: argparse.Namespace) -> str:
+    if purity >= args.d_high_purity_threshold:
+        return "label_balance_high_purity"
+    if purity >= args.d_mid_purity_low:
+        return "label_balance_mid_purity"
+    return "keep_low_purity"
+
+
+def strategy_d_leaf_reason(purity: float, args: argparse.Namespace) -> str:
+    if purity >= args.d_high_purity_threshold:
+        return f"purity>={args.d_high_purity_threshold}; downsample dominant label only"
+    if purity >= args.d_mid_purity_low:
+        return (
+            f"{args.d_mid_purity_low}<=purity<{args.d_high_purity_threshold}; "
+            "downsample labels with p>=target_share and upsample small labels")
+    return f"purity<{args.d_mid_purity_low}; keep unchanged"
+
+
+def proportional_target(count: int, ratio: float) -> int:
+    if count <= 0 or ratio <= 0:
+        return 0
+    return max(1, int(round(count * ratio)))
+
+
 def high_purity_dedup_ratio(purity: float, args: argparse.Namespace) -> Tuple[float, str, str]:
     if purity >= args.purity_high_threshold:
         return args.high_purity_ratio, "downsample_high_purity", f"purity>={args.purity_high_threshold}"
@@ -387,6 +613,66 @@ def write_strategy_dataset(
         print(f"{strategy}: wrote {total_holdout} dirty roundabout holdout rows")
 
 
+def write_strategy_d_dataset(
+        strategy: str,
+        strategy_dir: Path,
+        label_plan_rows: Sequence[Dict[str, Any]],
+        args: argparse.Namespace,
+        rng: random.Random) -> None:
+    shard_paths = [strategy_dir / f"{args.output_prefix}_{idx:05d}.jsonl" for idx in range(args.num_shards)]
+    holdout_paths = [strategy_dir / f"holdout_dirty_roundabout_{idx:05d}.jsonl" for idx in range(args.num_shards)]
+    rows_by_file: DefaultDict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for row in label_plan_rows:
+        rows_by_file[str(row["file"])].append(row)
+
+    total_written = 0
+    total_holdout = 0
+    with ExitStackFiles(shard_paths) as shard_files:
+        holdout_context = ExitStackFiles(holdout_paths) if args.write_holdout else NullFiles()
+        with holdout_context as holdout_files:
+            next_shard = 0
+            next_holdout = 0
+            for file_path, file_plan_rows in rows_by_file.items():
+                all_lines = list(iter_jsonl_lines(Path(file_path)))
+                if any(row["action"] == "holdout_dirty_roundabout" for row in file_plan_rows):
+                    if args.write_holdout:
+                        for line in all_lines:
+                            holdout_files[next_holdout].write(line)
+                            total_holdout += 1
+                            next_holdout = (next_holdout + 1) % len(holdout_files)
+                    continue
+                lines_by_label = group_lines_by_decision_label(all_lines)
+                for row in file_plan_rows:
+                    label = str(row["label"])
+                    selected = sample_lines(
+                        lines_by_label.get(label, []),
+                        int(row["target"]),
+                        args.upsample_mode,
+                        args.shuffle_output,
+                        rng,
+                    )
+                    for line in selected:
+                        shard_files[next_shard].write(line)
+                        total_written += 1
+                        next_shard = (next_shard + 1) % len(shard_files)
+    print(f"{strategy}: wrote {total_written} sampled rows")
+    if args.write_holdout:
+        print(f"{strategy}: wrote {total_holdout} dirty roundabout holdout rows")
+
+
+def group_lines_by_decision_label(lines: Sequence[str]) -> Dict[str, List[str]]:
+    lines_by_label: DefaultDict[str, List[str]] = defaultdict(list)
+    for line in lines:
+        label = UNKNOWN
+        try:
+            obj = json.loads(line)
+            label = sample_decision_label(obj) or UNKNOWN
+        except json.JSONDecodeError:
+            pass
+        lines_by_label[label].append(line)
+    return dict(lines_by_label)
+
+
 def sample_lines(
         lines: Sequence[str],
         target: int,
@@ -442,7 +728,8 @@ def build_summary(
         plan_rows: Sequence[Dict[str, Any]],
         total_target: int,
         label_counts: Counter,
-        args: argparse.Namespace) -> Dict[str, Any]:
+        args: argparse.Namespace,
+        label_plan_rows: Optional[Sequence[Dict[str, Any]]] = None) -> Dict[str, Any]:
     action_counts: Counter = Counter(row["action"] for row in plan_rows)
     action_targets: Counter = Counter()
     label_targets: Counter = Counter()
@@ -451,7 +738,17 @@ def build_summary(
             continue
         action_targets[row["action"]] += int(row["target"])
         label_targets[row["dominant_label"]] += int(row["target"])
-    return {
+    label_action_counts: Counter = Counter()
+    label_action_targets: Counter = Counter()
+    if label_plan_rows is not None:
+        label_targets = Counter()
+        for row in label_plan_rows:
+            label_action_counts[row["action"]] += 1
+            if row["action"] == "holdout_dirty_roundabout":
+                continue
+            label_action_targets[row["action"]] += int(row["target"])
+            label_targets[row["label"]] += int(row["target"])
+    summary = {
         "strategy": strategy,
         "total_target": total_target,
         "num_groups": len(plan_rows),
@@ -467,8 +764,22 @@ def build_summary(
             "roundabout_low_purity_threshold": args.roundabout_low_purity_threshold,
             "high_label_count": args.high_label_count,
             "low_label_count": args.low_label_count,
+            "d_high_purity_threshold": args.d_high_purity_threshold,
+            "d_mid_purity_low": args.d_mid_purity_low,
+            "d_dominant_label_ratio": args.d_dominant_label_ratio,
+            "d_mid_label_target_share": args.d_mid_label_target_share,
+            "d_min_label_target_count": args.d_min_label_target_count,
         },
     }
+    if label_plan_rows is not None:
+        summary["num_label_groups"] = len(label_plan_rows)
+        summary["label_action_counts"] = dict(label_action_counts)
+        summary["label_action_targets"] = dict(label_action_targets)
+        summary["files"] = {
+            "leaf_sampling_plan": "sampling_plan.csv",
+            "label_sampling_plan": "label_sampling_plan.csv",
+        }
+    return summary
 
 
 def is_roundabout_sample(row: Dict[str, Any], pattern: re.Pattern) -> bool:
