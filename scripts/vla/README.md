@@ -313,6 +313,33 @@ adaptive_report/
 - `adaptive_review_candidates.jsonl`: suspected label issues from high-purity
   leaf minorities and leaves that remain impure after recursive splitting.
 
+## Assign eval data to adaptive leaves
+
+`assign_eval_to_adaptive_leaf.py` maps an eval feature dump onto train adaptive
+leaves by nearest-neighbor search in the same feature space. Edit the config
+area at the top of the script or pass the equivalent CLI arguments:
+
+```shell
+python3 scripts/vla/assign_eval_to_adaptive_leaf.py \
+  --train-feature-dir /path/to/train_feature_dump \
+  --eval-feature-dir /path/to/eval_feature_dump \
+  --adaptive-dir /path/to/adaptive_report \
+  --output /path/to/eval_leaf_assignments.jsonl \
+  --matrix input_text_hash \
+  --metric cosine
+```
+
+The script writes per-eval-row assignments and a leaf-level summary:
+
+```text
+eval_leaf_assignments.jsonl
+eval_leaf_assignments.leaf_summary.csv
+eval_leaf_assignments.summary.json
+```
+
+Use the same matrix and metric as adaptive clustering, otherwise the nearest
+train leaf will not be comparable with the train bucket loss.
+
 ## Split raw JSONL by adaptive leaves
 
 `split_raw_by_adaptive_leaf.py` maps `adaptive_leaf_assignments.jsonl` back to
