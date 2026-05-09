@@ -557,7 +557,8 @@ Edit the config area at the top of the script or pass a JSON experiment list:
 python3 scripts/vla/bucket_diagnosis.py \
   --experiments-json /path/to/bucket_experiments.json \
   --output-dir /path/to/bucket_diagnosis \
-  --primary-eval-metric decision_acc
+  --primary-eval-metric decision_acc \
+  --threshold-mode auto
 ```
 
 Each eval JSONL row should contain `id`, `response`, and `labels`. The `id`
@@ -569,9 +570,27 @@ steps are inferred from the full path, so paths such as `ckpt-500/predictions.js
 are supported. If your eval output has a custom structure, adapt
 `read_eval_records()` and `record_assignment_key()`.
 
+Loss smoothing and trend parameters:
+
+- `MIN_LOSS_POINTS`: minimum scalar points required before a leaf loss curve is
+  diagnosed.
+- `WINDOW_POINTS`: number of points averaged at the start/end of a curve to
+  reduce noise in `loss_first` and `loss_final`.
+- `TAIL_FRACTION`: final fraction of the curve used to judge whether loss is
+  still descending, flat, or volatile.
+
+Diagnosis thresholds can be fixed with `--threshold-mode manual` or derived from
+the current experiment with `--threshold-mode auto`. Auto mode uses bucket
+distribution quantiles: low final-loss buckets become the easy-loss group, high
+final-loss buckets become hard/noisy candidates, eval high/low thresholds come
+from final eval metric quantiles, plateau slope comes from the distribution of
+absolute tail slopes, and high volatility comes from the tail-loss std
+distribution.
+
 ```text
 bucket_diagnosis/
   bucket_loss_metrics.csv
+  bucket_loss_timeseries.csv
   bucket_eval_timeseries.csv
   bucket_diagnosis.csv
   bucket_eval_unmatched.csv

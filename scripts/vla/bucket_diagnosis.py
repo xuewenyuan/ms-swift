@@ -60,6 +60,7 @@ LOW_EVAL_THRESHOLD = 0.6
 HIGH_EVAL_THRESHOLD = 0.85
 TAIL_SLOPE_EPS_PER_1K = 0.02
 HIGH_VOLATILITY_THRESHOLD = 0.12
+THRESHOLD_MODE = "manual"  # manual or auto
 # =========================
 
 
@@ -144,6 +145,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--high-eval-threshold", type=float, default=HIGH_EVAL_THRESHOLD)
     parser.add_argument("--tail-slope-eps-per-1k", type=float, default=TAIL_SLOPE_EPS_PER_1K)
     parser.add_argument("--high-volatility-threshold", type=float, default=HIGH_VOLATILITY_THRESHOLD)
+    parser.add_argument(
+        "--threshold-mode",
+        choices=("manual", "auto"),
+        default=THRESHOLD_MODE,
+        help="manual uses the explicit thresholds; auto derives thresholds from bucket distributions.")
     parser.add_argument("--plotly-js", default=PLOTLY_JS, help="Plotly.js URL/path for the dashboard.")
     return parser
 
@@ -156,6 +162,7 @@ def main() -> None:
 
     experiments = load_experiments(args)
     all_loss_rows = []
+    all_loss_point_rows = []
     all_eval_rows = []
     all_diag_rows = []
     all_unmatched_eval_rows = []
@@ -165,19 +172,21 @@ def main() -> None:
         name = str(exp["name"])
         leaf_meta = load_leaf_meta(exp)
         eval_assignments = load_eval_assignments(Path(exp["eval_leaf_assignments"]).expanduser())
-        loss_rows = load_experiment_loss(exp, leaf_meta, args)
+        loss_rows, loss_point_rows = load_experiment_loss(exp, leaf_meta, args)
         eval_rows, unmatched_eval_rows = load_experiment_eval(exp, eval_assignments)
         primary_metric = choose_primary_metric(eval_rows, args.primary_eval_metric)
-        diag_rows = diagnose_experiment(name, leaf_meta, loss_rows, eval_rows, primary_metric, args)
+        diag_rows, thresholds = diagnose_experiment(name, leaf_meta, loss_rows, eval_rows, primary_metric, args)
 
         all_loss_rows.extend(loss_rows)
+        all_loss_point_rows.extend(loss_point_rows)
         all_eval_rows.extend(sorted(eval_rows, key=lambda row: (str(row.get("experiment", "")), int(row.get("step", 0)),
                                                                int(row.get("leaf_id") or -1))))
         all_diag_rows.extend(diag_rows)
         all_unmatched_eval_rows.extend(unmatched_eval_rows)
-        summaries.append(build_experiment_summary(name, diag_rows, eval_rows, loss_rows, primary_metric))
+        summaries.append(build_experiment_summary(name, diag_rows, eval_rows, loss_rows, primary_metric, thresholds))
 
     write_csv(output_dir / "bucket_loss_metrics.csv", all_loss_rows)
+    write_csv(output_dir / "bucket_loss_timeseries.csv", all_loss_point_rows)
     write_csv(output_dir / "bucket_eval_timeseries.csv", all_eval_rows)
     write_csv(output_dir / "bucket_diagnosis.csv", all_diag_rows)
     write_csv(output_dir / "bucket_eval_unmatched.csv", all_unmatched_eval_rows)
@@ -187,6 +196,7 @@ def main() -> None:
         "experiments": summaries,
         "outputs": {
             "bucket_loss_metrics": "bucket_loss_metrics.csv",
+            "bucket_loss_timeseries": "bucket_loss_timeseries.csv",
             "bucket_eval_timeseries": "bucket_eval_timeseries.csv",
             "bucket_diagnosis": "bucket_diagnosis.csv",
             "bucket_eval_unmatched": "bucket_eval_unmatched.csv",
@@ -197,7 +207,8 @@ def main() -> None:
     write_json(output_dir / "bucket_diagnosis_summary.json", summary)
     (output_dir / "bucket_diagnosis_summary.md").write_text(render_markdown(summary, all_diag_rows), encoding="utf-8")
     (output_dir / "bucket_diagnosis_dashboard.html").write_text(
-        render_dashboard(summary, all_diag_rows, all_eval_rows, all_loss_rows, args.plotly_js), encoding="utf-8")
+        render_dashboard(summary, all_diag_rows, all_eval_rows, all_loss_rows, all_loss_point_rows, args.plotly_js),
+        encoding="utf-8")
     print(f"wrote bucket diagnosis for {len(experiments)} experiments -> {output_dir}")
 
 
@@ -346,18 +357,27 @@ def load_eval_assignments(path: Path) -> Dict[str, Dict[str, Any]]:
 def load_experiment_loss(
         exp: Dict[str, Any],
         leaf_meta: Dict[int, Dict[str, Any]],
-        args: argparse.Namespace) -> List[Dict[str, Any]]:
+        args: argparse.Namespace) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     if not (exp.get("loss_csv") or exp.get("tb_dir")):
-        return []
+        return [], []
     raw_points = load_loss_csv(Path(exp["loss_csv"]).expanduser()) if exp.get("loss_csv") else load_tensorboard_scalars(
         exp["tb_dir"])
     channel_points = filter_channel_scalars(raw_points, args.tag_prefix, args.mode_prefix)
     rows = []
+    point_rows = []
     for channel, points in sorted(channel_points.items()):
         leaf_id = parse_leaf_id_from_channel(channel)
         if leaf_id is None:
             continue
         clean_points = [(int(step), float(value)) for step, value in points if math.isfinite(float(value))]
+        for step, value in clean_points:
+            point_rows.append({
+                "experiment": exp["name"],
+                "leaf_id": leaf_id,
+                "channel": channel,
+                "step": step,
+                "loss": value,
+            })
         if len(clean_points) < args.min_loss_points:
             continue
         metrics = summarize_loss_curve(clean_points, args.window_points, args.tail_fraction)
@@ -369,7 +389,7 @@ def load_experiment_loss(
             **leaf_meta_fields(meta),
             **metrics,
         })
-    return rows
+    return rows, point_rows
 
 
 def summarize_loss_curve(points: Sequence[Tuple[int, float]], window_points: int, tail_fraction: float) -> Dict[str, Any]:
@@ -680,28 +700,69 @@ def diagnose_experiment(
         loss_rows: Sequence[Dict[str, Any]],
         eval_rows: Sequence[Dict[str, Any]],
         primary_metric: str,
-        args: argparse.Namespace) -> List[Dict[str, Any]]:
+        args: argparse.Namespace) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     loss_by_leaf = {int(row["leaf_id"]): row for row in loss_rows if row.get("leaf_id") not in (None, "")}
     eval_summary = summarize_eval_by_leaf(eval_rows, primary_metric, not args.eval_lower_is_better)
+    thresholds = build_thresholds(loss_rows, eval_summary, args)
     leaf_ids = sorted(set(loss_by_leaf) | set(eval_summary) | set(leaf_meta))
     rows = []
     for leaf_id in leaf_ids:
         loss = loss_by_leaf.get(leaf_id, {})
         eval_item = eval_summary.get(leaf_id, {})
         meta = leaf_meta.get(leaf_id, {})
-        recommendation, reason = recommend_bucket(loss, eval_item, meta, primary_metric, args)
+        recommendation, reason = recommend_bucket(loss, eval_item, meta, primary_metric, thresholds, args)
         rows.append({
             "experiment": name,
             "leaf_id": leaf_id,
             **leaf_meta_fields(meta),
             **prefixed(loss, include_prefix=False, skip={"experiment", "leaf_id"}),
             "primary_eval_metric": primary_metric,
+            "threshold_mode": thresholds["threshold_mode"],
             **eval_item,
             "recommendation": recommendation,
             "diagnosis_reason": reason,
         })
     rows.sort(key=lambda row: (row["recommendation"], -float_or(row.get("loss_final"), -1.0), int(row["leaf_id"])))
-    return rows
+    return rows, thresholds
+
+
+def build_thresholds(
+        loss_rows: Sequence[Dict[str, Any]],
+        eval_summary: Dict[int, Dict[str, Any]],
+        args: argparse.Namespace) -> Dict[str, Any]:
+    thresholds = {
+        "threshold_mode": args.threshold_mode,
+        "easy_loss_threshold": args.easy_loss_threshold,
+        "high_loss_threshold": args.high_loss_threshold,
+        "noisy_loss_threshold": args.noisy_loss_threshold,
+        "low_eval_threshold": args.low_eval_threshold,
+        "high_eval_threshold": args.high_eval_threshold,
+        "tail_slope_eps_per_1k": args.tail_slope_eps_per_1k,
+        "high_volatility_threshold": args.high_volatility_threshold,
+    }
+    if args.threshold_mode != "auto":
+        return thresholds
+
+    final_losses = clean_floats(row.get("loss_final") for row in loss_rows)
+    tail_slopes = clean_floats(row.get("loss_tail_slope_per_1k") for row in loss_rows)
+    tail_stds = clean_floats(row.get("loss_tail_std") for row in loss_rows)
+    eval_finals = clean_floats(row.get("eval_metric_final") for row in eval_summary.values())
+
+    if final_losses:
+        thresholds["easy_loss_threshold"] = percentile(final_losses, 0.25)
+        thresholds["high_loss_threshold"] = percentile(final_losses, 0.75)
+        thresholds["noisy_loss_threshold"] = max(thresholds["high_loss_threshold"], percentile(final_losses, 0.90))
+    if eval_finals:
+        low_eval = percentile(eval_finals, 0.25)
+        high_eval = percentile(eval_finals, 0.75)
+        thresholds["low_eval_threshold"] = min(low_eval, high_eval)
+        thresholds["high_eval_threshold"] = max(low_eval, high_eval)
+    if tail_slopes:
+        abs_slopes = [abs(value) for value in tail_slopes]
+        thresholds["tail_slope_eps_per_1k"] = max(1e-8, percentile(abs_slopes, 0.30))
+    if tail_stds:
+        thresholds["high_volatility_threshold"] = percentile(tail_stds, 0.75)
+    return thresholds
 
 
 def summarize_eval_by_leaf(
@@ -743,6 +804,7 @@ def recommend_bucket(
         eval_item: Dict[str, Any],
         meta: Dict[str, Any],
         primary_metric: str,
+        thresholds: Dict[str, Any],
         args: argparse.Namespace) -> Tuple[str, str]:
     eval_count = to_int(eval_item.get("eval_count_final"))
     has_eval = primary_metric and eval_item.get("eval_metric_final") is not None and eval_count >= args.min_eval_count
@@ -753,14 +815,14 @@ def recommend_bucket(
             return "eval_only_insufficient_samples", (
                 f"no channel-loss curve; eval_count={eval_count}, min_eval_count={args.min_eval_count}")
         if args.eval_lower_is_better:
-            if eval_final <= args.low_eval_threshold:
+            if eval_final <= thresholds["low_eval_threshold"]:
                 return "eval_only_good", f"no channel-loss curve; eval={eval_final}"
-            if eval_final >= args.high_eval_threshold:
+            if eval_final >= thresholds["high_eval_threshold"]:
                 return "eval_only_review", f"no channel-loss curve; low eval quality={eval_final}"
         else:
-            if eval_final >= args.high_eval_threshold:
+            if eval_final >= thresholds["high_eval_threshold"]:
                 return "eval_only_good", f"no channel-loss curve; eval={eval_final}"
-            if eval_final <= args.low_eval_threshold:
+            if eval_final <= thresholds["low_eval_threshold"]:
                 return "eval_only_review", f"no channel-loss curve; low eval={eval_final}"
         return "eval_only_mixed", f"no channel-loss curve; eval={eval_final}"
     if primary_metric and not has_eval:
@@ -771,30 +833,30 @@ def recommend_bucket(
     tail_std = to_float(loss.get("loss_tail_std"))
     rel_drop = to_float(loss.get("loss_relative_drop"))
     if args.eval_lower_is_better:
-        high_eval = not has_eval or eval_final <= args.low_eval_threshold
-        low_eval = has_eval and eval_final >= args.high_eval_threshold
+        high_eval = not has_eval or eval_final <= thresholds["low_eval_threshold"]
+        low_eval = has_eval and eval_final >= thresholds["high_eval_threshold"]
     else:
-        high_eval = not has_eval or eval_final >= args.high_eval_threshold
-        low_eval = has_eval and eval_final <= args.low_eval_threshold
-    still_descending = tail_slope <= -args.tail_slope_eps_per_1k
-    plateau = abs(tail_slope) <= args.tail_slope_eps_per_1k
-    volatile = tail_std >= args.high_volatility_threshold
+        high_eval = not has_eval or eval_final >= thresholds["high_eval_threshold"]
+        low_eval = has_eval and eval_final <= thresholds["low_eval_threshold"]
+    still_descending = tail_slope <= -thresholds["tail_slope_eps_per_1k"]
+    plateau = abs(tail_slope) <= thresholds["tail_slope_eps_per_1k"]
+    volatile = tail_std >= thresholds["high_volatility_threshold"]
 
-    if final_loss <= args.easy_loss_threshold and high_eval:
+    if final_loss <= thresholds["easy_loss_threshold"] and high_eval:
         return "downsample_more", f"easy bucket: final_loss={final_loss:.4f}, eval={eval_final}"
-    if final_loss >= args.noisy_loss_threshold and plateau and volatile and low_eval:
+    if final_loss >= thresholds["noisy_loss_threshold"] and plateau and volatile and low_eval:
         return "suspected_noisy_review", (
             f"high plateau/volatile loss and low eval: loss={final_loss:.4f}, tail_std={tail_std:.4f}, eval={eval_final}")
-    if final_loss >= args.high_loss_threshold and still_descending:
+    if final_loss >= thresholds["high_loss_threshold"] and still_descending:
         return "undertrained_upsample_or_replay", (
             f"loss still descending: final_loss={final_loss:.4f}, tail_slope_per_1k={tail_slope:.4f}")
-    if final_loss >= args.high_loss_threshold and plateau and low_eval:
+    if final_loss >= thresholds["high_loss_threshold"] and plateau and low_eval:
         return "hard_or_noisy_review", f"high plateau loss with low eval: loss={final_loss:.4f}, eval={eval_final}"
-    if final_loss >= args.high_loss_threshold and (eval_delta is None or eval_delta >= 0):
+    if final_loss >= thresholds["high_loss_threshold"] and (eval_delta is None or eval_delta >= 0):
         return "hard_but_valid_curriculum", f"high loss but eval not degrading: loss={final_loss:.4f}, eval_delta={eval_delta}"
-    if final_loss <= args.easy_loss_threshold and not high_eval:
+    if final_loss <= thresholds["easy_loss_threshold"] and not high_eval:
         return "eval_mismatch_check", f"low train loss but eval not high: loss={final_loss:.4f}, eval={eval_final}"
-    if rel_drop < 0.05 and final_loss > args.easy_loss_threshold:
+    if rel_drop < 0.05 and final_loss > thresholds["easy_loss_threshold"]:
         return "low_learning_signal_review", f"small relative loss drop={rel_drop:.4f}"
     return "healthy_keep", f"loss={final_loss:.4f}, eval={eval_final}"
 
@@ -804,11 +866,13 @@ def build_experiment_summary(
         diag_rows: Sequence[Dict[str, Any]],
         eval_rows: Sequence[Dict[str, Any]],
         loss_rows: Sequence[Dict[str, Any]],
-        primary_metric: str) -> Dict[str, Any]:
+        primary_metric: str,
+        thresholds: Dict[str, Any]) -> Dict[str, Any]:
     rec_counts = Counter(row["recommendation"] for row in diag_rows)
     return {
         "experiment": name,
         "primary_eval_metric": primary_metric,
+        "thresholds": thresholds,
         "num_diagnosed_buckets": len(diag_rows),
         "num_loss_buckets": len(loss_rows),
         "num_eval_bucket_steps": len(eval_rows),
@@ -911,6 +975,32 @@ def linear_slope(x: Sequence[Optional[float]], y: Sequence[Optional[float]]) -> 
 def mean(values: Sequence[Optional[float]]) -> float:
     clean = [float(value) for value in values if value is not None]
     return sum(clean) / len(clean) if clean else 0.0
+
+
+def clean_floats(values: Iterable[Any]) -> List[float]:
+    out = []
+    for value in values:
+        parsed = to_float(value)
+        if parsed is not None and math.isfinite(parsed):
+            out.append(parsed)
+    return out
+
+
+def percentile(values: Sequence[float], q: float) -> float:
+    clean = sorted(float(value) for value in values if math.isfinite(float(value)))
+    if not clean:
+        return 0.0
+    if q <= 0:
+        return clean[0]
+    if q >= 1:
+        return clean[-1]
+    pos = (len(clean) - 1) * q
+    low = int(math.floor(pos))
+    high = int(math.ceil(pos))
+    if low == high:
+        return clean[low]
+    weight = pos - low
+    return clean[low] * (1.0 - weight) + clean[high] * weight
 
 
 def std(values: Sequence[Optional[float]]) -> float:
@@ -1018,6 +1108,7 @@ def render_dashboard(
         diag_rows: Sequence[Dict[str, Any]],
         eval_rows: Sequence[Dict[str, Any]],
         loss_rows: Sequence[Dict[str, Any]],
+        loss_point_rows: Sequence[Dict[str, Any]],
         plotly_js: str) -> str:
     payload = json.dumps(
         {
@@ -1025,6 +1116,7 @@ def render_dashboard(
             "diagnosis": list(diag_rows),
             "eval": list(eval_rows),
             "loss": list(loss_rows),
+            "loss_points": list(loss_point_rows),
         },
         ensure_ascii=False,
     )
@@ -1060,7 +1152,7 @@ def render_dashboard(
     <div class="controls">
       <div><label>Experiment</label><select id="exp"></select></div>
       <div><label>Recommendation</label><select id="rec"></select></div>
-      <div><label>Leaf ID</label><input id="leaf" placeholder="All leaves or one leaf id" /></div>
+      <div><label>Leaf ID</label><select id="leaf"></select></div>
       <div><label>Metric</label><select id="metric"></select></div>
     </div>
     <div class="cards">
@@ -1071,7 +1163,7 @@ def render_dashboard(
     </div>
     <div class="grid">
       <div class="panel"><h2>Loss vs Eval</h2><div id="scatter" class="chart"></div></div>
-      <div class="panel"><h2>Eval Metric by Step</h2><div id="eval-curve" class="chart"></div></div>
+      <div class="panel"><h2>Leaf Loss and Eval by Step</h2><div id="eval-curve" class="chart"></div></div>
       <div class="panel"><h2>Recommendation Counts</h2><div id="rec-bar" class="chart"></div></div>
       <div class="panel"><h2>Bucket Table</h2><div id="table"></div></div>
     </div>
@@ -1080,18 +1172,23 @@ def render_dashboard(
     const DATA = {payload};
     const diag = DATA.diagnosis;
     const evalRows = DATA.eval;
+    const lossPoints = DATA.loss_points || [];
     const experiments = [...new Set(diag.map(r => r.experiment))].sort();
     const recs = [...new Set(diag.map(r => r.recommendation))].sort();
     const metricNames = [...new Set(evalRows.flatMap(r => Object.keys(r).filter(k => typeof r[k] === 'number' && !['step','leaf_id','eval_count'].includes(k))))].sort();
     const expSelect = document.getElementById('exp');
     const recSelect = document.getElementById('rec');
+    const leafSelect = document.getElementById('leaf');
     const metricSelect = document.getElementById('metric');
     expSelect.innerHTML = '<option value="">All</option>' + experiments.map(v => `<option>${{v}}</option>`).join('');
     recSelect.innerHTML = '<option value="">All</option>' + recs.map(v => `<option>${{v}}</option>`).join('');
     metricSelect.innerHTML = metricNames.map(v => `<option>${{v}}</option>`).join('');
     const preferred = metricNames.includes('decision_acc') ? 'decision_acc' : metricNames[0];
     if (preferred) metricSelect.value = preferred;
-    for (const el of [expSelect, recSelect, metricSelect, document.getElementById('leaf')]) {{
+    updateLeafOptions();
+    expSelect.addEventListener('change', () => {{ updateLeafOptions(); render(); }});
+    recSelect.addEventListener('change', () => {{ updateLeafOptions(); render(); }});
+    for (const el of [metricSelect, leafSelect]) {{
       el.addEventListener('input', render);
       el.addEventListener('change', render);
     }}
@@ -1100,9 +1197,19 @@ def render_dashboard(
       return {{
         exp: expSelect.value,
         rec: recSelect.value,
-        leaf: document.getElementById('leaf').value.trim(),
+        leaf: leafSelect.value,
         metric: metricSelect.value
       }};
+    }}
+    function updateLeafOptions() {{
+      const current = leafSelect.value;
+      const exp = expSelect.value;
+      const rec = recSelect.value;
+      const leafIds = [...new Set(diag
+        .filter(r => (!exp || r.experiment === exp) && (!rec || r.recommendation === rec))
+        .map(r => String(r.leaf_id)))].sort((a,b) => Number(a) - Number(b));
+      leafSelect.innerHTML = '<option value="">All</option>' + leafIds.map(v => `<option value="${{v}}">${{v}}</option>`).join('');
+      if (leafIds.includes(current)) leafSelect.value = current;
     }}
     function filteredDiag() {{
       const f = filters();
@@ -1125,7 +1232,7 @@ def render_dashboard(
       document.getElementById('mean-loss').textContent = fmt(meanLoss);
       document.getElementById('mean-eval').textContent = fmt(meanEval);
       renderScatter(rows, finalEvalByLeaf, f.metric);
-      renderEvalCurve(evalFiltered, f.metric);
+      renderLeafTrend(evalFiltered, rows, f.metric);
       renderRecBar(rows);
       renderTable(rows, finalEvalByLeaf, f.metric);
     }}
@@ -1147,21 +1254,44 @@ def render_dashboard(
         yaxis: {{ title: metric }}
       }}, {{ responsive:true }});
     }}
-    function renderEvalCurve(rows, metric) {{
+    function renderLeafTrend(evalFiltered, diagRows, metric) {{
+      const f = filters();
+      const selectedLeaf = f.leaf || (diagRows.length === 1 ? String(diagRows[0].leaf_id) : '');
+      if (!selectedLeaf) {{
+        Plotly.newPlot('eval-curve', [], {{
+          margin: {{ l: 56, r: 24, t: 24, b: 48 }},
+          annotations: [{{ text:'Select one leaf to compare eval metric and train loss.', x:0.5, y:0.5, xref:'paper', yref:'paper', showarrow:false }}]
+        }}, {{ responsive:true }});
+        return;
+      }}
+      const allowed = new Set(diagRows.filter(r => String(r.leaf_id) === selectedLeaf).map(r => `${{r.experiment}}::${{r.leaf_id}}`));
+      const evalRowsForLeaf = evalFiltered.filter(r => allowed.has(`${{r.experiment}}::${{r.leaf_id}}`));
+      const lossRowsForLeaf = lossPoints.filter(r => allowed.has(`${{r.experiment}}::${{r.leaf_id}}`));
       const groups = new Map();
-      for (const r of rows) {{
+      for (const r of evalRowsForLeaf) {{
         const key = `${{r.experiment}} leaf ${{r.leaf_id}}`;
         if (!groups.has(key)) groups.set(key, []);
         groups.get(key).push(r);
       }}
       const traces = [...groups.entries()].slice(0, 80).map(([key, vals]) => {{
         vals.sort((a,b)=>Number(a.step)-Number(b.step));
-        return {{ type:'scatter', mode:'lines+markers', name:key, x:vals.map(r=>r.step), y:vals.map(r=>r[metric]) }};
+        return {{ type:'scatter', mode:'lines+markers', name:`eval ${{key}}`, x:vals.map(r=>r.step), y:vals.map(r=>r[metric]), yaxis:'y' }};
       }});
+      const lossGroups = new Map();
+      for (const r of lossRowsForLeaf) {{
+        const key = `${{r.experiment}} leaf ${{r.leaf_id}}`;
+        if (!lossGroups.has(key)) lossGroups.set(key, []);
+        lossGroups.get(key).push(r);
+      }}
+      for (const [key, vals] of lossGroups.entries()) {{
+        vals.sort((a,b)=>Number(a.step)-Number(b.step));
+        traces.push({{ type:'scatter', mode:'lines', name:`loss ${{key}}`, x:vals.map(r=>r.step), y:vals.map(r=>r.loss), yaxis:'y2', line:{{ dash:'dot' }} }});
+      }}
       Plotly.newPlot('eval-curve', traces, {{
         margin: {{ l: 56, r: 24, t: 12, b: 48 }},
         xaxis: {{ title:'step' }},
         yaxis: {{ title: metric }},
+        yaxis2: {{ title:'train loss', overlaying:'y', side:'right', showgrid:false }},
         showlegend: traces.length <= 20
       }}, {{ responsive:true }});
     }}
