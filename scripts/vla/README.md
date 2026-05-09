@@ -598,6 +598,17 @@ bucket_diagnosis/
   bucket_diagnosis_summary.json
   bucket_diagnosis_summary.md
   bucket_diagnosis_dashboard.html
+  bucket_diagnosis_dashboard_data/
+```
+
+The dashboard keeps large per-leaf eval/loss time series in
+`bucket_diagnosis_dashboard_data/` and loads them only when a leaf is selected.
+Because browsers often block `fetch()` from `file://` pages, serve the output
+directory over HTTP for the interactive leaf trend chart:
+
+```shell
+cd /path/to/bucket_diagnosis
+python3 -m http.server 8000
 ```
 
 ## Sampling raw JSONL from bucket targets

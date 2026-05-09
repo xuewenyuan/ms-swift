@@ -191,6 +191,8 @@ def main() -> None:
     write_csv(output_dir / "bucket_diagnosis.csv", all_diag_rows)
     write_csv(output_dir / "bucket_eval_unmatched.csv", all_unmatched_eval_rows)
     write_csv(output_dir / "bucket_diagnosis_action_summary.csv", build_action_summary(all_diag_rows))
+    dashboard_data_dir = output_dir / "bucket_diagnosis_dashboard_data"
+    dashboard_data_index = write_dashboard_data(dashboard_data_dir, all_eval_rows, all_loss_point_rows)
     summary = {
         "num_experiments": len(experiments),
         "experiments": summaries,
@@ -202,12 +204,13 @@ def main() -> None:
             "bucket_eval_unmatched": "bucket_eval_unmatched.csv",
             "bucket_diagnosis_action_summary": "bucket_diagnosis_action_summary.csv",
             "bucket_diagnosis_dashboard": "bucket_diagnosis_dashboard.html",
+            "bucket_diagnosis_dashboard_data": "bucket_diagnosis_dashboard_data/",
         },
     }
     write_json(output_dir / "bucket_diagnosis_summary.json", summary)
     (output_dir / "bucket_diagnosis_summary.md").write_text(render_markdown(summary, all_diag_rows), encoding="utf-8")
     (output_dir / "bucket_diagnosis_dashboard.html").write_text(
-        render_dashboard(summary, all_diag_rows, all_eval_rows, all_loss_rows, all_loss_point_rows, args.plotly_js),
+        render_dashboard(summary, all_diag_rows, all_loss_rows, dashboard_data_index, args.plotly_js),
         encoding="utf-8")
     print(f"wrote bucket diagnosis for {len(experiments)} experiments -> {output_dir}")
 
@@ -1103,20 +1106,66 @@ def render_markdown(summary: Dict[str, Any], diag_rows: Sequence[Dict[str, Any]]
     return "\n".join(lines)
 
 
+def write_dashboard_data(
+        data_dir: Path,
+        eval_rows: Sequence[Dict[str, Any]],
+        loss_point_rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    data_dir.mkdir(parents=True, exist_ok=True)
+    leaf_keys = sorted(
+        {leaf_data_key(row) for row in eval_rows if row.get("leaf_id") not in (None, "")}
+        | {leaf_data_key(row) for row in loss_point_rows if row.get("leaf_id") not in (None, "")})
+    leaf_files = {}
+    metric_names = set()
+    eval_by_key: DefaultDict[str, List[Dict[str, Any]]] = defaultdict(list)
+    loss_by_key: DefaultDict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for row in eval_rows:
+        if row.get("leaf_id") not in (None, ""):
+            eval_by_key[leaf_data_key(row)].append(dict(row))
+        for key, value in row.items():
+            if key not in {"experiment", "step", "leaf_id", "eval_count", "eval_file"} and isinstance(value, (int, float)):
+                metric_names.add(str(key))
+    for row in loss_point_rows:
+        if row.get("leaf_id") not in (None, ""):
+            loss_by_key[leaf_data_key(row)].append(dict(row))
+    for key in leaf_keys:
+        filename = f"{safe_filename(key)}.json"
+        payload = {
+            "eval": sorted(eval_by_key.get(key, []), key=lambda row: int(row.get("step", 0))),
+            "loss_points": sorted(loss_by_key.get(key, []), key=lambda row: int(row.get("step", 0))),
+        }
+        write_json(data_dir / filename, payload)
+        leaf_files[key] = filename
+    index = {
+        "version": 1,
+        "data_dir": "bucket_diagnosis_dashboard_data",
+        "leaf_files": leaf_files,
+        "metric_names": sorted(metric_names),
+        "num_leaf_files": len(leaf_files),
+    }
+    write_json(data_dir / "index.json", index)
+    return index
+
+
+def leaf_data_key(row: Dict[str, Any]) -> str:
+    return f"{row.get('experiment', '')}::{row.get('leaf_id', '')}"
+
+
+def safe_filename(value: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", value).strip("_") or "leaf"
+
+
 def render_dashboard(
         summary: Dict[str, Any],
         diag_rows: Sequence[Dict[str, Any]],
-        eval_rows: Sequence[Dict[str, Any]],
         loss_rows: Sequence[Dict[str, Any]],
-        loss_point_rows: Sequence[Dict[str, Any]],
+        dashboard_data_index: Dict[str, Any],
         plotly_js: str) -> str:
     payload = json.dumps(
         {
             "summary": summary,
             "diagnosis": list(diag_rows),
-            "eval": list(eval_rows),
             "loss": list(loss_rows),
-            "loss_points": list(loss_point_rows),
+            "dashboard_data": dashboard_data_index,
         },
         ensure_ascii=False,
     )
@@ -1140,6 +1189,7 @@ def render_dashboard(
     .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(560px, 1fr)); gap: 16px; }}
     .panel {{ background: white; border: 1px solid #dde3ea; border-radius: 8px; padding: 14px; overflow: auto; }}
     .chart {{ height: 420px; }}
+    .hint {{ color: #647184; font-size: 12px; margin: 4px 0 10px; }}
     table {{ width: 100%; border-collapse: collapse; font-size: 12px; }}
     th, td {{ padding: 7px 8px; border-bottom: 1px solid #e6ebf0; text-align: right; white-space: nowrap; }}
     th:first-child, td:first-child {{ text-align: left; }}
@@ -1163,7 +1213,7 @@ def render_dashboard(
     </div>
     <div class="grid">
       <div class="panel"><h2>Loss vs Eval</h2><div id="scatter" class="chart"></div></div>
-      <div class="panel"><h2>Leaf Loss and Eval by Step</h2><div id="eval-curve" class="chart"></div></div>
+      <div class="panel"><h2>Leaf Loss and Eval by Step</h2><p id="leaf-trend-hint" class="hint"></p><div id="eval-curve" class="chart"></div></div>
       <div class="panel"><h2>Recommendation Counts</h2><div id="rec-bar" class="chart"></div></div>
       <div class="panel"><h2>Bucket Table</h2><div id="table"></div></div>
     </div>
@@ -1171,11 +1221,12 @@ def render_dashboard(
   <script>
     const DATA = {payload};
     const diag = DATA.diagnosis;
-    const evalRows = DATA.eval;
-    const lossPoints = DATA.loss_points || [];
+    const dashboardData = DATA.dashboard_data || {{}};
+    const leafFiles = dashboardData.leaf_files || {{}};
+    const leafCache = new Map();
     const experiments = [...new Set(diag.map(r => r.experiment))].sort();
     const recs = [...new Set(diag.map(r => r.recommendation))].sort();
-    const metricNames = [...new Set(evalRows.flatMap(r => Object.keys(r).filter(k => typeof r[k] === 'number' && !['step','leaf_id','eval_count'].includes(k))))].sort();
+    const metricNames = [...new Set([...(dashboardData.metric_names || []), 'eval_metric_final', 'eval_metric_best', 'eval_metric_delta'])].sort();
     const expSelect = document.getElementById('exp');
     const recSelect = document.getElementById('rec');
     const leafSelect = document.getElementById('leaf');
@@ -1219,31 +1270,42 @@ def render_dashboard(
       const f = filters();
       const rows = filteredDiag();
       const leaves = new Set(rows.map(r => `${{r.experiment}}::${{r.leaf_id}}`));
-      const evalFiltered = evalRows.filter(r => leaves.has(`${{r.experiment}}::${{r.leaf_id}}`) && (!f.exp || r.experiment === f.exp));
       const finalEvalByLeaf = new Map();
-      for (const r of evalFiltered) {{
-        const key = `${{r.experiment}}::${{r.leaf_id}}`;
-        if (!finalEvalByLeaf.has(key) || Number(r.step) > Number(finalEvalByLeaf.get(key).step)) finalEvalByLeaf.set(key, r);
+      for (const r of rows) {{
+        finalEvalByLeaf.set(`${{r.experiment}}::${{r.leaf_id}}`, {{
+          step: r.eval_last_step,
+          eval_count: r.eval_count_final,
+          eval_metric_final: r.eval_metric_final,
+          eval_metric_best: r.eval_metric_best,
+          eval_metric_delta: r.eval_metric_delta,
+          decision_acc: r.primary_eval_metric === 'decision_acc' ? r.eval_metric_final : undefined
+        }});
       }}
       document.getElementById('bucket-count').textContent = rows.length;
       document.getElementById('eval-count').textContent = [...finalEvalByLeaf.values()].reduce((s, r) => s + Number(r.eval_count || 0), 0);
       const meanLoss = mean(rows.map(r => asNum(r.loss_final)).filter(Number.isFinite));
-      const meanEval = mean([...finalEvalByLeaf.values()].map(r => asNum(r[f.metric])).filter(Number.isFinite));
+      const meanEval = mean(rows.map(r => metricValueFromDiag(r, f.metric)).filter(Number.isFinite));
       document.getElementById('mean-loss').textContent = fmt(meanLoss);
       document.getElementById('mean-eval').textContent = fmt(meanEval);
       renderScatter(rows, finalEvalByLeaf, f.metric);
-      renderLeafTrend(evalFiltered, rows, f.metric);
+      renderLeafTrend(rows, f.metric);
       renderRecBar(rows);
       renderTable(rows, finalEvalByLeaf, f.metric);
     }}
     function mean(xs) {{ return xs.length ? xs.reduce((a,b)=>a+b,0)/xs.length : NaN; }}
     function fmt(v) {{ return Number.isFinite(v) ? v.toFixed(4) : '-'; }}
+    function metricValueFromDiag(r, metric) {{
+      if (metric === 'eval_metric_final') return asNum(r.eval_metric_final);
+      if (metric === 'eval_metric_best') return asNum(r.eval_metric_best);
+      if (metric === 'eval_metric_delta') return asNum(r.eval_metric_delta);
+      if (metric === r.primary_eval_metric) return asNum(r.eval_metric_final);
+      return asNum(r[metric]);
+    }}
     function renderScatter(rows, finalEvalByLeaf, metric) {{
       const x = [], y = [], text = [], color = [];
       for (const r of rows) {{
         const key = `${{r.experiment}}::${{r.leaf_id}}`;
-        const e = finalEvalByLeaf.get(key);
-        const xv = asNum(r.loss_final), yv = e ? asNum(e[metric]) : NaN;
+        const xv = asNum(r.loss_final), yv = metricValueFromDiag(r, metric);
         if (!Number.isFinite(xv) || !Number.isFinite(yv)) continue;
         x.push(xv); y.push(yv); color.push(asNum(r.purity));
         text.push(`${{r.experiment}} leaf=${{r.leaf_id}}<br>${{r.recommendation}}<br>${{r.dominant_label}}<br>${{r.diagnosis_reason}}`);
@@ -1254,10 +1316,11 @@ def render_dashboard(
         yaxis: {{ title: metric }}
       }}, {{ responsive:true }});
     }}
-    function renderLeafTrend(evalFiltered, diagRows, metric) {{
+    async function renderLeafTrend(diagRows, metric) {{
       const f = filters();
       const selectedLeaf = f.leaf || (diagRows.length === 1 ? String(diagRows[0].leaf_id) : '');
       if (!selectedLeaf) {{
+        document.getElementById('leaf-trend-hint').textContent = '';
         Plotly.newPlot('eval-curve', [], {{
           margin: {{ l: 56, r: 24, t: 24, b: 48 }},
           annotations: [{{ text:'Select one leaf to compare eval metric and train loss.', x:0.5, y:0.5, xref:'paper', yref:'paper', showarrow:false }}]
@@ -1265,8 +1328,23 @@ def render_dashboard(
         return;
       }}
       const allowed = new Set(diagRows.filter(r => String(r.leaf_id) === selectedLeaf).map(r => `${{r.experiment}}::${{r.leaf_id}}`));
-      const evalRowsForLeaf = evalFiltered.filter(r => allowed.has(`${{r.experiment}}::${{r.leaf_id}}`));
-      const lossRowsForLeaf = lossPoints.filter(r => allowed.has(`${{r.experiment}}::${{r.leaf_id}}`));
+      let leafPayloads;
+      try {{
+        leafPayloads = await Promise.all([...allowed].map(loadLeafData));
+      }} catch (err) {{
+        document.getElementById('leaf-trend-hint').textContent = 'Leaf detail JSON could not be loaded. Serve this directory over HTTP, for example: python3 -m http.server';
+        Plotly.newPlot('eval-curve', [], {{
+          margin: {{ l: 56, r: 24, t: 24, b: 48 }},
+          annotations: [{{ text:String(err), x:0.5, y:0.5, xref:'paper', yref:'paper', showarrow:false }}]
+        }}, {{ responsive:true }});
+        return;
+      }}
+      document.getElementById('leaf-trend-hint').textContent = leafPayloads.length ? '' : 'No detail data for this leaf.';
+      const evalRowsForLeaf = leafPayloads.flatMap(item => item.eval || []);
+      const lossRowsForLeaf = leafPayloads.flatMap(item => item.loss_points || []);
+      const trendMetric = metric.startsWith('eval_metric_')
+        ? ((diagRows.find(r => String(r.leaf_id) === selectedLeaf) || {{}}).primary_eval_metric || 'decision_acc')
+        : metric;
       const groups = new Map();
       for (const r of evalRowsForLeaf) {{
         const key = `${{r.experiment}} leaf ${{r.leaf_id}}`;
@@ -1275,7 +1353,7 @@ def render_dashboard(
       }}
       const traces = [...groups.entries()].slice(0, 80).map(([key, vals]) => {{
         vals.sort((a,b)=>Number(a.step)-Number(b.step));
-        return {{ type:'scatter', mode:'lines+markers', name:`eval ${{key}}`, x:vals.map(r=>r.step), y:vals.map(r=>r[metric]), yaxis:'y' }};
+        return {{ type:'scatter', mode:'lines+markers', name:`eval ${{key}}`, x:vals.map(r=>r.step), y:vals.map(r=>r[trendMetric]), yaxis:'y' }};
       }});
       const lossGroups = new Map();
       for (const r of lossRowsForLeaf) {{
@@ -1290,10 +1368,21 @@ def render_dashboard(
       Plotly.newPlot('eval-curve', traces, {{
         margin: {{ l: 56, r: 24, t: 12, b: 48 }},
         xaxis: {{ title:'step' }},
-        yaxis: {{ title: metric }},
+        yaxis: {{ title: trendMetric }},
         yaxis2: {{ title:'train loss', overlaying:'y', side:'right', showgrid:false }},
         showlegend: traces.length <= 20
       }}, {{ responsive:true }});
+    }}
+    async function loadLeafData(key) {{
+      if (leafCache.has(key)) return leafCache.get(key);
+      const filename = leafFiles[key];
+      if (!filename) return {{ eval: [], loss_points: [] }};
+      const path = `${{dashboardData.data_dir || 'bucket_diagnosis_dashboard_data'}}/${{filename}}`;
+      const response = await fetch(path);
+      if (!response.ok) throw new Error(`failed to load ${{path}}: ${{response.status}}`);
+      const data = await response.json();
+      leafCache.set(key, data);
+      return data;
     }}
     function renderRecBar(rows) {{
       const counts = {{}};
