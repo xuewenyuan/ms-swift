@@ -785,7 +785,7 @@ def summarize_eval_by_leaf(
         final_metric = to_float(final_row.get(primary_metric))
         best_metric = best_value(metric_values, higher_is_better)
         first_metric = metric_values[0] if metric_values else None
-        out[leaf_id] = {
+        item = {
             "eval_num_steps": len(rows),
             "eval_first_step": int(rows[0].get("step", 0)),
             "eval_last_step": int(final_row.get("step", 0)),
@@ -799,7 +799,31 @@ def summarize_eval_by_leaf(
                 [to_float(row.get(primary_metric)) for row in rows if row.get(primary_metric) not in (None, "")],
             ) * 1000.0 if len(metric_values) >= 2 else None,
         }
+        for metric in numeric_eval_metric_names(rows):
+            values = [to_float(row.get(metric)) for row in rows if row.get(metric) not in (None, "")]
+            if not values:
+                continue
+            metric_higher_is_better = higher_is_better
+            final_value = to_float(final_row.get(metric))
+            first_value = values[0]
+            item[f"eval_first_{metric}"] = first_value
+            item[f"eval_final_{metric}"] = final_value
+            item[f"eval_best_{metric}"] = best_value(values, metric_higher_is_better)
+            item[f"eval_delta_{metric}"] = none_sub(final_value, first_value)
+        out[leaf_id] = item
     return out
+
+
+def numeric_eval_metric_names(rows: Sequence[Dict[str, Any]]) -> List[str]:
+    names = set()
+    skip = {"experiment", "step", "leaf_id", "eval_count", "eval_file"}
+    for row in rows:
+        for key, value in row.items():
+            if key in skip or str(key).endswith("_counter"):
+                continue
+            if isinstance(value, (int, float)):
+                names.add(str(key))
+    return sorted(names)
 
 
 def recommend_bucket(
@@ -1319,6 +1343,7 @@ def render_dashboard(
       if (metric === 'eval_metric_final') return asNum(r.eval_metric_final);
       if (metric === 'eval_metric_best') return asNum(r.eval_metric_best);
       if (metric === 'eval_metric_delta') return asNum(r.eval_metric_delta);
+      if (r[`eval_final_${{metric}}`] !== undefined) return asNum(r[`eval_final_${{metric}}`]);
       if (metric === r.primary_eval_metric) return asNum(r.eval_metric_final);
       return asNum(r[metric]);
     }}
@@ -1442,7 +1467,7 @@ def render_dashboard(
       for (const r of sorted) {{
         const e = finalEvalByLeaf.get(`${{r.experiment}}::${{r.leaf_id}}`) || {{}};
         const trainCount = r.sampled_target ?? r.label_target_total ?? r.raw_count ?? '';
-        html += `<tr><td>${{esc(r.experiment)}}</td><td>${{r.leaf_id}}</td><td>${{esc(r.recommendation)}}</td><td>${{fmt(asNum(r.purity))}}</td><td>${{fmt(asNum(r.loss_final))}}</td><td>${{fmt(asNum(e[metric]))}}</td><td>${{e.eval_count || ''}}</td><td>${{esc(r.raw_count ?? '')}}</td><td>${{esc(trainCount)}}</td><td>${{fmt(asNum(r.sample_ratio))}}</td><td>${{esc(r.dominant_label || '')}}</td><td class="reason">${{esc(r.diagnosis_reason || '')}}</td></tr>`;
+        html += `<tr><td>${{esc(r.experiment)}}</td><td>${{r.leaf_id}}</td><td>${{esc(r.recommendation)}}</td><td>${{fmt(asNum(r.purity))}}</td><td>${{fmt(asNum(r.loss_final))}}</td><td>${{fmt(metricValueFromDiag(r, metric))}}</td><td>${{e.eval_count || ''}}</td><td>${{esc(r.raw_count ?? '')}}</td><td>${{esc(trainCount)}}</td><td>${{fmt(asNum(r.sample_ratio))}}</td><td>${{esc(r.dominant_label || '')}}</td><td class="reason">${{esc(r.diagnosis_reason || '')}}</td></tr>`;
       }}
       html += '</tbody></table>';
       document.getElementById('table').innerHTML = html;
