@@ -524,6 +524,56 @@ channel_loss_purity/
   channel_loss_purity_dashboard.html
 ```
 
+`bucket_diagnosis.py` joins one or more sampling experiments with TensorBoard
+channel loss, per-checkpoint eval prediction JSONL files, and eval-to-leaf
+assignments. It computes lateral/longitudinal decision correctness from each
+row's `response` and `labels` fields with logic aligned to
+`examples/train/plugins/lateral_decision_metric_plugin.py`, then aggregates the
+metrics by adaptive leaf. It produces recommendations such as `downsample_more`,
+`undertrained_upsample_or_replay`, `suspected_noisy_review`, and
+`hard_but_valid_curriculum`.
+Edit the config area at the top of the script or pass a JSON experiment list:
+
+```json
+[
+  {
+    "name": "sample_d",
+    "tb_dir": "/path/to/train_output/runs",
+    "eval_json_glob": "/path/to/eval/ckpt-*/predictions.jsonl",
+    "eval_leaf_assignments": "/path/to/eval_leaf_assignments.jsonl",
+    "split_manifest": "/path/to/adaptive_leaf_jsonl/split_manifest.csv",
+    "sampling_plan": "/path/to/D_aggressive_purity_label_sampling/sampling_plan.csv",
+    "label_sampling_plan": "/path/to/D_aggressive_purity_label_sampling/label_sampling_plan.csv"
+  }
+]
+```
+
+```shell
+python3 scripts/vla/bucket_diagnosis.py \
+  --experiments-json /path/to/bucket_experiments.json \
+  --output-dir /path/to/bucket_diagnosis \
+  --primary-eval-metric decision_acc
+```
+
+Each eval JSONL row should contain `id`, `response`, and `labels`. The `id`
+should be `scene_id_sample_token`; it is matched to `eval_leaf_assignments.jsonl`
+through `eval_scene_id` + `_` + `eval_sample_token`. The script also keeps a
+fallback JSON parser for common `records` / `samples` / `predictions` structures.
+If your eval output has a custom structure, adapt `read_eval_records()` and
+`record_assignment_key()`.
+
+```text
+bucket_diagnosis/
+  bucket_loss_metrics.csv
+  bucket_eval_timeseries.csv
+  bucket_diagnosis.csv
+  bucket_eval_unmatched.csv
+  bucket_diagnosis_action_summary.csv
+  bucket_diagnosis_summary.json
+  bucket_diagnosis_summary.md
+  bucket_diagnosis_dashboard.html
+```
+
 ## Sampling raw JSONL from bucket targets
 
 `sample_from_buckets.py` applies `sampling_buckets.csv` targets back to the
