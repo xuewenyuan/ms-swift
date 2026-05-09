@@ -27,7 +27,7 @@ from analyze_cluster_mining import safe_div, write_csv
 OUTPUT_DIR = ""
 
 # Fill one or more experiments here, or pass --experiments-json.
-# Each eval_json_glob should match one prediction JSONL per checkpoint step.
+# eval_json_glob can be a string glob or a list of JSONL paths/globs, one prediction file per checkpoint.
 # Every JSONL row is expected to contain response, labels, and id fields.
 EXPERIMENTS = [
     {
@@ -123,8 +123,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--experiments-json",
         default=None,
         help=(
-            "Optional JSON list of experiments. Each item supports name, tb_dir/loss_csv, eval_json_glob, "
-            "eval_leaf_assignments, split_manifest, sampling_plan, label_sampling_plan."))
+            "Optional JSON list of experiments. Each item supports name, optional tb_dir/loss_csv, "
+            "eval_json_glob as a string or list, eval_leaf_assignments, split_manifest, sampling_plan, "
+            "label_sampling_plan."))
     parser.add_argument("--tag-prefix", default=TAG_PREFIX, help="TensorBoard channel scalar prefix. Default: loss_.")
     parser.add_argument("--mode-prefix", default=MODE_PREFIX, help="TensorBoard mode prefix. Default: train/.")
     parser.add_argument("--min-loss-points", type=int, default=MIN_LOSS_POINTS)
@@ -226,8 +227,6 @@ def load_experiments(args: argparse.Namespace) -> List[Dict[str, Any]]:
             raise ValueError(f"experiment #{idx} is not an object")
         exp = dict(item)
         exp["name"] = str(exp.get("name") or f"exp_{idx:02d}")
-        if not (exp.get("tb_dir") or exp.get("loss_csv")):
-            raise ValueError(f"experiment {exp['name']} missing tb_dir or loss_csv")
         if not exp.get("eval_json_glob"):
             raise ValueError(f"experiment {exp['name']} missing eval_json_glob")
         if not exp.get("eval_leaf_assignments"):
@@ -348,6 +347,8 @@ def load_experiment_loss(
         exp: Dict[str, Any],
         leaf_meta: Dict[int, Dict[str, Any]],
         args: argparse.Namespace) -> List[Dict[str, Any]]:
+    if not (exp.get("loss_csv") or exp.get("tb_dir")):
+        return []
     raw_points = load_loss_csv(Path(exp["loss_csv"]).expanduser()) if exp.get("loss_csv") else load_tensorboard_scalars(
         exp["tb_dir"])
     channel_points = filter_channel_scalars(raw_points, args.tag_prefix, args.mode_prefix)
@@ -406,7 +407,7 @@ def summarize_loss_curve(points: Sequence[Tuple[int, float]], window_points: int
 def load_experiment_eval(
         exp: Dict[str, Any],
         eval_assignments: Dict[str, Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    eval_paths = sorted(Path(path) for path in glob.glob(str(exp["eval_json_glob"])))
+    eval_paths = resolve_eval_paths(exp["eval_json_glob"])
     rows = []
     unmatched = []
     for path in eval_paths:
@@ -454,6 +455,28 @@ def load_experiment_eval(
                     item[metric] = mean([to_float(value) for value in values])
             rows.append(item)
     return rows, unmatched
+
+
+def resolve_eval_paths(value: Any) -> List[Path]:
+    if isinstance(value, (list, tuple)):
+        patterns = value
+    else:
+        patterns = [value]
+    paths = []
+    seen = set()
+    for pattern in patterns:
+        if pattern in (None, ""):
+            continue
+        expanded = sorted(glob.glob(str(Path(str(pattern)).expanduser())))
+        if not expanded:
+            expanded = [str(Path(str(pattern)).expanduser())]
+        for item in expanded:
+            path = Path(item)
+            key = str(path)
+            if key not in seen:
+                paths.append(path)
+                seen.add(key)
+    return sorted(paths, key=lambda path: (infer_step_from_eval(path), str(path)))
 
 
 def read_eval_records(path: Path) -> List[Dict[str, Any]]:
@@ -721,10 +744,25 @@ def recommend_bucket(
         meta: Dict[str, Any],
         primary_metric: str,
         args: argparse.Namespace) -> Tuple[str, str]:
-    if not loss:
-        return "missing_loss", "no channel-loss curve matched this leaf"
     eval_count = to_int(eval_item.get("eval_count_final"))
     has_eval = primary_metric and eval_item.get("eval_metric_final") is not None and eval_count >= args.min_eval_count
+    eval_final = to_float(eval_item.get("eval_metric_final"))
+    eval_delta = to_float(eval_item.get("eval_metric_delta"))
+    if not loss:
+        if not has_eval:
+            return "eval_only_insufficient_samples", (
+                f"no channel-loss curve; eval_count={eval_count}, min_eval_count={args.min_eval_count}")
+        if args.eval_lower_is_better:
+            if eval_final <= args.low_eval_threshold:
+                return "eval_only_good", f"no channel-loss curve; eval={eval_final}"
+            if eval_final >= args.high_eval_threshold:
+                return "eval_only_review", f"no channel-loss curve; low eval quality={eval_final}"
+        else:
+            if eval_final >= args.high_eval_threshold:
+                return "eval_only_good", f"no channel-loss curve; eval={eval_final}"
+            if eval_final <= args.low_eval_threshold:
+                return "eval_only_review", f"no channel-loss curve; low eval={eval_final}"
+        return "eval_only_mixed", f"no channel-loss curve; eval={eval_final}"
     if primary_metric and not has_eval:
         return "insufficient_eval_samples", f"eval_count={eval_count}, min_eval_count={args.min_eval_count}"
 
@@ -732,8 +770,6 @@ def recommend_bucket(
     tail_slope = to_float(loss.get("loss_tail_slope_per_1k"))
     tail_std = to_float(loss.get("loss_tail_std"))
     rel_drop = to_float(loss.get("loss_relative_drop"))
-    eval_final = to_float(eval_item.get("eval_metric_final"))
-    eval_delta = to_float(eval_item.get("eval_metric_delta"))
     if args.eval_lower_is_better:
         high_eval = not has_eval or eval_final <= args.low_eval_threshold
         low_eval = has_eval and eval_final >= args.high_eval_threshold

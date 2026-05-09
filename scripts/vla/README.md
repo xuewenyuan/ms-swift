@@ -526,8 +526,10 @@ channel_loss_purity/
 
 `bucket_diagnosis.py` joins one or more sampling experiments with TensorBoard
 channel loss, per-checkpoint eval prediction JSONL files, and eval-to-leaf
-assignments. It computes lateral/longitudinal decision correctness from each
-row's `response` and `labels` fields with logic aligned to
+assignments. `tb_dir` / `loss_csv` are optional; if they are omitted, the script
+still produces eval-only bucket diagnosis and the HTML dashboard. It computes
+lateral/longitudinal decision correctness from each row's `response` and `labels`
+fields with logic aligned to
 `examples/train/plugins/lateral_decision_metric_plugin.py`, then aggregates the
 metrics by adaptive leaf. It produces recommendations such as `downsample_more`,
 `undertrained_upsample_or_replay`, `suspected_noisy_review`, and
@@ -539,7 +541,10 @@ Edit the config area at the top of the script or pass a JSON experiment list:
   {
     "name": "sample_d",
     "tb_dir": "/path/to/train_output/runs",
-    "eval_json_glob": "/path/to/eval/ckpt-*/predictions.jsonl",
+    "eval_json_glob": [
+      "/path/to/eval/ckpt-500/predictions.jsonl",
+      "/path/to/eval/ckpt-1000/predictions.jsonl"
+    ],
     "eval_leaf_assignments": "/path/to/eval_leaf_assignments.jsonl",
     "split_manifest": "/path/to/adaptive_leaf_jsonl/split_manifest.csv",
     "sampling_plan": "/path/to/D_aggressive_purity_label_sampling/sampling_plan.csv",
@@ -559,8 +564,10 @@ Each eval JSONL row should contain `id`, `response`, and `labels`. The `id`
 should be `scene_id_sample_token`; it is matched to `eval_leaf_assignments.jsonl`
 through `eval_scene_id` + `_` + `eval_sample_token`. The script also keeps a
 fallback JSON parser for common `records` / `samples` / `predictions` structures.
-If your eval output has a custom structure, adapt `read_eval_records()` and
-`record_assignment_key()`.
+`eval_json_glob` can be a single glob string or a list of paths/globs; checkpoint
+steps are inferred from the full path, so paths such as `ckpt-500/predictions.jsonl`
+are supported. If your eval output has a custom structure, adapt
+`read_eval_records()` and `record_assignment_key()`.
 
 ```text
 bucket_diagnosis/
