@@ -1204,6 +1204,9 @@ def render_dashboard(
       <div><label>Recommendation</label><select id="rec"></select></div>
       <div><label>Leaf ID</label><select id="leaf"></select></div>
       <div><label>Metric</label><select id="metric"></select></div>
+      <div><label>Metric Min</label><input id="metric-min" type="number" step="0.01" placeholder="e.g. 0.0" /></div>
+      <div><label>Metric Max</label><input id="metric-max" type="number" step="0.01" placeholder="e.g. 0.8" /></div>
+      <div><label>Eval Count Min</label><input id="eval-count-min" type="number" step="1" placeholder="e.g. 20" /></div>
     </div>
     <div class="cards">
       <div class="card"><div class="label">Buckets</div><div class="value" id="bucket-count"></div></div>
@@ -1231,6 +1234,9 @@ def render_dashboard(
     const recSelect = document.getElementById('rec');
     const leafSelect = document.getElementById('leaf');
     const metricSelect = document.getElementById('metric');
+    const metricMinInput = document.getElementById('metric-min');
+    const metricMaxInput = document.getElementById('metric-max');
+    const evalCountMinInput = document.getElementById('eval-count-min');
     expSelect.innerHTML = '<option value="">All</option>' + experiments.map(v => `<option>${{v}}</option>`).join('');
     recSelect.innerHTML = '<option value="">All</option>' + recs.map(v => `<option>${{v}}</option>`).join('');
     metricSelect.innerHTML = metricNames.map(v => `<option>${{v}}</option>`).join('');
@@ -1239,9 +1245,12 @@ def render_dashboard(
     updateLeafOptions();
     expSelect.addEventListener('change', () => {{ updateLeafOptions(); render(); }});
     recSelect.addEventListener('change', () => {{ updateLeafOptions(); render(); }});
-    for (const el of [metricSelect, leafSelect]) {{
-      el.addEventListener('input', render);
-      el.addEventListener('change', render);
+    metricSelect.addEventListener('change', () => {{ updateLeafOptions(); render(); }});
+    leafSelect.addEventListener('input', render);
+    leafSelect.addEventListener('change', render);
+    for (const el of [metricMinInput, metricMaxInput, evalCountMinInput]) {{
+      el.addEventListener('input', () => {{ updateLeafOptions(); render(); }});
+      el.addEventListener('change', () => {{ updateLeafOptions(); render(); }});
     }}
     function asNum(v) {{ return v === null || v === undefined || v === '' ? NaN : Number(v); }}
     function filters() {{
@@ -1249,22 +1258,34 @@ def render_dashboard(
         exp: expSelect.value,
         rec: recSelect.value,
         leaf: leafSelect.value,
-        metric: metricSelect.value
+        metric: metricSelect.value,
+        metricMin: asNum(metricMinInput.value),
+        metricMax: asNum(metricMaxInput.value),
+        evalCountMin: asNum(evalCountMinInput.value)
       }};
+    }}
+    function passesMetricFilters(r, f) {{
+      const metricValue = metricValueFromDiag(r, f.metric);
+      const evalCount = asNum(r.eval_count_final);
+      if (Number.isFinite(f.metricMin) && (!Number.isFinite(metricValue) || metricValue < f.metricMin)) return false;
+      if (Number.isFinite(f.metricMax) && (!Number.isFinite(metricValue) || metricValue > f.metricMax)) return false;
+      if (Number.isFinite(f.evalCountMin) && (!Number.isFinite(evalCount) || evalCount < f.evalCountMin)) return false;
+      return true;
     }}
     function updateLeafOptions() {{
       const current = leafSelect.value;
-      const exp = expSelect.value;
-      const rec = recSelect.value;
-      const leafIds = [...new Set(diag
-        .filter(r => (!exp || r.experiment === exp) && (!rec || r.recommendation === rec))
-        .map(r => String(r.leaf_id)))].sort((a,b) => Number(a) - Number(b));
-      leafSelect.innerHTML = '<option value="">All</option>' + leafIds.map(v => `<option value="${{v}}">${{v}}</option>`).join('');
-      if (leafIds.includes(current)) leafSelect.value = current;
+      const f = filters();
+      const items = diag
+        .filter(r => (!f.exp || r.experiment === f.exp) && (!f.rec || r.recommendation === f.rec) && passesMetricFilters(r, f))
+        .map(r => ({{ key: `${{r.experiment}}::${{r.leaf_id}}`, label: `${{r.experiment}} / leaf ${{r.leaf_id}}`, leaf: Number(r.leaf_id) }}));
+      const unique = [...new Map(items.map(item => [item.key, item])).values()]
+        .sort((a,b) => String(a.label).localeCompare(String(b.label), undefined, {{ numeric:true }}));
+      leafSelect.innerHTML = '<option value="">All</option>' + unique.map(item => `<option value="${{item.key}}">${{item.label}}</option>`).join('');
+      if (unique.some(item => item.key === current)) leafSelect.value = current;
     }}
     function filteredDiag() {{
       const f = filters();
-      return diag.filter(r => (!f.exp || r.experiment === f.exp) && (!f.rec || r.recommendation === f.rec) && (!f.leaf || String(r.leaf_id) === f.leaf));
+      return diag.filter(r => (!f.exp || r.experiment === f.exp) && (!f.rec || r.recommendation === f.rec) && (!f.leaf || `${{r.experiment}}::${{r.leaf_id}}` === f.leaf) && passesMetricFilters(r, f));
     }}
     function render() {{
       const f = filters();
@@ -1318,8 +1339,8 @@ def render_dashboard(
     }}
     async function renderLeafTrend(diagRows, metric) {{
       const f = filters();
-      const selectedLeaf = f.leaf || (diagRows.length === 1 ? String(diagRows[0].leaf_id) : '');
-      if (!selectedLeaf) {{
+      const selectedKey = f.leaf || (diagRows.length === 1 ? `${{diagRows[0].experiment}}::${{diagRows[0].leaf_id}}` : '');
+      if (!selectedKey) {{
         document.getElementById('leaf-trend-hint').textContent = '';
         Plotly.newPlot('eval-curve', [], {{
           margin: {{ l: 56, r: 24, t: 24, b: 48 }},
@@ -1327,7 +1348,7 @@ def render_dashboard(
         }}, {{ responsive:true }});
         return;
       }}
-      const allowed = new Set(diagRows.filter(r => String(r.leaf_id) === selectedLeaf).map(r => `${{r.experiment}}::${{r.leaf_id}}`));
+      const allowed = new Set(diagRows.filter(r => `${{r.experiment}}::${{r.leaf_id}}` === selectedKey).map(r => `${{r.experiment}}::${{r.leaf_id}}`));
       let leafPayloads;
       try {{
         leafPayloads = await Promise.all([...allowed].map(loadLeafData));
@@ -1339,11 +1360,13 @@ def render_dashboard(
         }}, {{ responsive:true }});
         return;
       }}
-      document.getElementById('leaf-trend-hint').textContent = leafPayloads.length ? '' : 'No detail data for this leaf.';
+      document.getElementById('leaf-trend-hint').innerHTML = leafPayloads.length
+        ? `${{leafSummaryHtml(selectedKey, diagRows)}}<br>Loaded detail JSON from ${{esc(detailPathForKey(selectedKey))}}`
+        : 'No detail data for this leaf.';
       const evalRowsForLeaf = leafPayloads.flatMap(item => item.eval || []);
       const lossRowsForLeaf = leafPayloads.flatMap(item => item.loss_points || []);
       const trendMetric = metric.startsWith('eval_metric_')
-        ? ((diagRows.find(r => String(r.leaf_id) === selectedLeaf) || {{}}).primary_eval_metric || 'decision_acc')
+        ? ((diagRows.find(r => `${{r.experiment}}::${{r.leaf_id}}` === selectedKey) || {{}}).primary_eval_metric || 'decision_acc')
         : metric;
       const groups = new Map();
       for (const r of evalRowsForLeaf) {{
@@ -1377,12 +1400,31 @@ def render_dashboard(
       if (leafCache.has(key)) return leafCache.get(key);
       const filename = leafFiles[key];
       if (!filename) return {{ eval: [], loss_points: [] }};
-      const path = `${{dashboardData.data_dir || 'bucket_diagnosis_dashboard_data'}}/${{filename}}`;
+      const path = detailPathForKey(key);
       const response = await fetch(path);
       if (!response.ok) throw new Error(`failed to load ${{path}}: ${{response.status}}`);
       const data = await response.json();
       leafCache.set(key, data);
       return data;
+    }}
+    function detailPathForKey(key) {{
+      const filename = leafFiles[key] || '';
+      return `${{dashboardData.data_dir || 'bucket_diagnosis_dashboard_data'}}/${{filename}}`;
+    }}
+    function leafSummaryHtml(key, rows) {{
+      const row = rows.find(r => `${{r.experiment}}::${{r.leaf_id}}` === key) || {{}};
+      const trainCount = row.sampled_target ?? row.label_target_total ?? row.raw_count ?? '';
+      const parts = [
+        `experiment=${{esc(row.experiment || '')}}`,
+        `leaf=${{esc(row.leaf_id ?? '')}}`,
+        `eval_n=${{esc(row.eval_count_final ?? '')}}`,
+        `raw=${{esc(row.raw_count ?? '')}}`,
+        `train=${{esc(trainCount)}}`,
+        `sample_ratio=${{fmt(asNum(row.sample_ratio))}}`,
+        `purity=${{fmt(asNum(row.purity))}}`,
+        `label=${{esc(row.dominant_label || '')}}`
+      ];
+      return parts.join(' · ');
     }}
     function renderRecBar(rows) {{
       const counts = {{}};
@@ -1396,10 +1438,11 @@ def render_dashboard(
     }}
     function renderTable(rows, finalEvalByLeaf, metric) {{
       const sorted = [...rows].sort((a,b)=>String(a.recommendation).localeCompare(String(b.recommendation)) || asNum(b.loss_final)-asNum(a.loss_final)).slice(0, 300);
-      let html = '<table><thead><tr><th>experiment</th><th>leaf</th><th>rec</th><th>purity</th><th>loss</th><th>'+metric+'</th><th>eval_n</th><th>label</th><th class="reason">reason</th></tr></thead><tbody>';
+      let html = '<table><thead><tr><th>experiment</th><th>leaf</th><th>rec</th><th>purity</th><th>loss</th><th>'+metric+'</th><th>eval_n</th><th>raw</th><th>train</th><th>ratio</th><th>label</th><th class="reason">reason</th></tr></thead><tbody>';
       for (const r of sorted) {{
         const e = finalEvalByLeaf.get(`${{r.experiment}}::${{r.leaf_id}}`) || {{}};
-        html += `<tr><td>${{esc(r.experiment)}}</td><td>${{r.leaf_id}}</td><td>${{esc(r.recommendation)}}</td><td>${{fmt(asNum(r.purity))}}</td><td>${{fmt(asNum(r.loss_final))}}</td><td>${{fmt(asNum(e[metric]))}}</td><td>${{e.eval_count || ''}}</td><td>${{esc(r.dominant_label || '')}}</td><td class="reason">${{esc(r.diagnosis_reason || '')}}</td></tr>`;
+        const trainCount = r.sampled_target ?? r.label_target_total ?? r.raw_count ?? '';
+        html += `<tr><td>${{esc(r.experiment)}}</td><td>${{r.leaf_id}}</td><td>${{esc(r.recommendation)}}</td><td>${{fmt(asNum(r.purity))}}</td><td>${{fmt(asNum(r.loss_final))}}</td><td>${{fmt(asNum(e[metric]))}}</td><td>${{e.eval_count || ''}}</td><td>${{esc(r.raw_count ?? '')}}</td><td>${{esc(trainCount)}}</td><td>${{fmt(asNum(r.sample_ratio))}}</td><td>${{esc(r.dominant_label || '')}}</td><td class="reason">${{esc(r.diagnosis_reason || '')}}</td></tr>`;
       }}
       html += '</tbody></table>';
       document.getElementById('table').innerHTML = html;
