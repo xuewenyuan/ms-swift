@@ -27,12 +27,15 @@
     - 后续由 `AuxSeparateHeads` 内部调用
   - `config.py`
     - 负责统一加载辅助任务参数
-- `aux_head/`
-  - `BevAuxHead / CogAuxHead / GodAuxHead` 只保留接口定义
-  - `AuxSeparateHeads` 统一管理三类 head
-- `aux_loss/`
-  - `BevAuxLoss / CogAuxLoss / GodAuxLoss` 只保留接口定义
-  - `AuxSeparateLosses` 统一管理三类 loss
+- `aux_heads.py`
+  - 和 `plugin.py` 同层
+  - 统一管理三类 head 的注册和分发
+- `aux_losses.py`
+  - 和 `plugin.py` 同层
+  - 统一管理三类 loss 的注册和分发
+- `aux_task/`
+  - 按任务拆分 `bev / cog / god`
+  - 每个任务目录下放自己的 `AuxHead` 和 `AuxLoss`
 - `dataset.py`
   - 保留 `y_bev`, `y_cog`, `y_god`
   - 支持将 `bev_label/cog_label/god_label` 映射到 `y_*`
@@ -154,5 +157,6 @@ god_label -> y_god
 - 当前 `VGGTUpsampler` 也是接口骨架，具体实现由 `AuxSeparateHeads` 内部接入
 - 当前实现优先保证单图 / 单视频 / 多媒体顺序输入可跑通
 - 你后续只需要补齐这几个接口的具体实现：
-  - `BevAuxHead / CogAuxHead / GodAuxHead`
-  - `BevAuxLoss / CogAuxLoss / GodAuxLoss`
+  - `aux_task/bev/bev_aux_head.py`, `aux_task/bev/bev_aux_loss.py`
+  - `aux_task/cog/cog_aux_head.py`, `aux_task/cog/cog_aux_loss.py`
+  - `aux_task/god/god_aux_head.py`, `aux_task/god/god_aux_loss.py`

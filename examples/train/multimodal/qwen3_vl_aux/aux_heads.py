@@ -2,9 +2,9 @@ from typing import Any, Dict
 
 from torch import nn
 
-from .bev_aux_head import BevAuxHead
-from .cog_aux_head import CogAuxHead
-from .god_aux_head import GodAuxHead
+from aux_task.bev.bev_aux_head import BevAuxHead
+from aux_task.cog.cog_aux_head import CogAuxHead
+from aux_task.god.god_aux_head import GodAuxHead
 
 
 AUX_HEAD_REGISTRY = {

@@ -2,9 +2,9 @@ from typing import Any, Dict
 
 from torch import nn
 
-from .bev_aux_loss import BevAuxLoss
-from .cog_aux_loss import CogAuxLoss
-from .god_aux_loss import GodAuxLoss
+from aux_task.bev.bev_aux_loss import BevAuxLoss
+from aux_task.cog.cog_aux_loss import CogAuxLoss
+from aux_task.god.god_aux_loss import GodAuxLoss
 
 
 AUX_LOSS_REGISTRY = {

@@ -13,8 +13,8 @@ PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
 if PLUGIN_DIR not in sys.path:
     sys.path.insert(0, PLUGIN_DIR)
 
-from aux_head import AuxSeparateHeads
-from aux_loss import AuxSeparateLosses
+from aux_heads import AuxSeparateHeads
+from aux_losses import AuxSeparateLosses
 from common.config import AUX_TASKS, build_aux_config, get_aux_head_lr
 from common.visual_feature_extractor import Qwen3VLAuxFeatureExtractor
 from swift.llm import deep_getattr, get_multimodal_target_regex
