@@ -1,0 +1,38 @@
+{
+  "shared": {
+    "layer_indices": [6, 13, 20, 27],
+    "merge_size": 2,
+    "lm_loss_weight": 1.0,
+    "upsampler_cfg": {
+      "patch_size": 32,
+      "features": 256,
+      "out_channels": [256, 512, 1024, 1024]
+    }
+  },
+  "tasks": {
+    "bev": {
+      "label_key": "y_bev",
+      "loss_weight": 1.0,
+      "head": {
+        "num_classes": 2
+      },
+      "loss": {}
+    },
+    "cog": {
+      "label_key": "y_cog",
+      "loss_weight": 1.0,
+      "head": {
+        "num_classes": 2
+      },
+      "loss": {}
+    },
+    "god": {
+      "label_key": "y_god",
+      "loss_weight": 1.0,
+      "head": {
+        "num_classes": 2
+      },
+      "loss": {}
+    }
+  }
+}

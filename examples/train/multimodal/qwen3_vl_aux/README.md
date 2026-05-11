@@ -16,12 +16,23 @@
   - 注册 `loss_type=qwen3vl_aux`
   - 注册 `optimizer=qwen3vl_aux`
   - patch `Qwen3-VL` forward，强制返回 `hidden_states`
-  - 从四层 LLM hidden states 中抽取视觉 token
-  - 将视觉 token 重排为 `VGGT-style DPTHead` 需要的 patch grid
-  - 构建三个分支：
-    - `Bev DPTHead -> BevAuxHead -> BevAuxLoss`
-    - `Cog DPTHead -> CogAuxHead -> CogAuxLoss`
-    - `God DPTHead -> GodAuxHead -> GodAuxLoss`
+  - 调用公共 `feature_extractor`
+  - 将视觉特征和任务配置转交给 `AuxHead/AuxLoss`
+- `common/`
+  - `visual_feature_extractor.py`
+    - 负责从 Qwen3-VL 输出中抽取视觉 hidden states
+    - 负责按 image/video token span 重组媒体级输入
+  - `vggt_upsampler.py`
+    - 提供 `VGGTUpsampler` 接口
+    - 后续由 `AuxSeparateHeads` 内部调用
+  - `config.py`
+    - 负责统一加载辅助任务参数
+- `aux_head/`
+  - `BevAuxHead / CogAuxHead / GodAuxHead` 只保留接口定义
+  - `AuxSeparateHeads` 统一管理三类 head
+- `aux_loss/`
+  - `BevAuxLoss / CogAuxLoss / GodAuxLoss` 只保留接口定义
+  - `AuxSeparateLosses` 统一管理三类 loss
 - `dataset.py`
   - 保留 `y_bev`, `y_cog`, `y_god`
   - 支持将 `bev_label/cog_label/god_label` 映射到 `y_*`
@@ -35,11 +46,10 @@
 
 ```text
 selected hidden states [6,13,20,27]
-    -> task-specific DPTHead
-    -> feature map
-    -> task-specific AuxHead
-    -> logits
-    -> CrossEntropy loss
+    -> feature extractor
+    -> task-specific AuxHead (internally calls VGGTUpsampler)
+    -> predictions
+    -> task-specific AuxLoss
 ```
 
 主任务仍然走 `ms-swift` 标准的 LM loss，也就是 assistant 文本里包含的 `action + trajectory` token 监督。
@@ -90,12 +100,59 @@ god_label -> y_god
 - `QWEN3VL_GOD_LOSS_WEIGHT`
 - `QWEN3VL_AUX_HEAD_LR`
   - 默认辅助分支学习率
+- `QWEN3VL_AUX_CONFIG_PATH`
+  - 推荐通过一个 JSON 文件集中传辅助任务参数
+- `QWEN3VL_AUX_CONFIG`
+  - 也支持直接传 JSON 字符串，更适合临时调试
+
+推荐把辅助任务参数分成两层：
+
+```json
+{
+  "shared": {
+    "layer_indices": [6, 13, 20, 27],
+    "merge_size": 2,
+    "lm_loss_weight": 1.0,
+    "upsampler_cfg": {
+      "patch_size": 32,
+      "features": 256,
+      "out_channels": [256, 512, 1024, 1024]
+    }
+  },
+  "tasks": {
+    "bev": {
+      "label_key": "y_bev",
+      "loss_weight": 1.0,
+      "head": {},
+      "loss": {}
+    },
+    "cog": {
+      "label_key": "y_cog",
+      "loss_weight": 1.0,
+      "head": {},
+      "loss": {}
+    },
+    "god": {
+      "label_key": "y_god",
+      "loss_weight": 1.0,
+      "head": {},
+      "loss": {}
+    }
+  }
+}
+```
+
+这种传法更合适，因为：
+
+- shared 参数只写一次，比如 `layer_indices / merge_size / upsampler_cfg`
+- 每个任务只维护自己的 `label_key / loss_weight / head / loss`
+- plugin 不需要为了新任务参数继续扩展新的环境变量
 
 ## 当前边界
 
-- 当前 `AuxHead` / `AuxLoss` 先用最简单的分类头 + `CrossEntropy`
-- 当前三条辅助分支各自有一套 DPTHead，不共享上采样权重
+- 当前 `AuxHead` / `AuxLoss` 已经改成接口骨架，本仓库里不包含你的具体任务实现
+- 当前 `VGGTUpsampler` 也是接口骨架，具体实现由 `AuxSeparateHeads` 内部接入
 - 当前实现优先保证单图 / 单视频 / 多媒体顺序输入可跑通
-- 更复杂的任务输出形式，例如 dense map、box、trajectory field、multi-label / regression，可以继续替换：
+- 你后续只需要补齐这几个接口的具体实现：
   - `BevAuxHead / CogAuxHead / GodAuxHead`
   - `BevAuxLoss / CogAuxLoss / GodAuxLoss`
