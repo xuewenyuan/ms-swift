@@ -1,5 +1,6 @@
 {
   "shared": {
+    "enabled_tasks": ["bev", "god"],
     "layer_indices": [6, 13, 20, 27],
     "merge_size": 2,
     "lm_loss_weight": 1.0,
@@ -10,6 +11,7 @@
       "cache_size": 256
     },
     "upsampler_cfg": {
+      "type": "updeconv",
       "patch_size": 32,
       "features": 256,
       "out_channels": [256, 512, 1024, 1024]

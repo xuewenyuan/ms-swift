@@ -11,6 +11,10 @@ def _parse_int_list(raw: str) -> List[int]:
     return [int(item.strip()) for item in raw.split(',') if item.strip()]
 
 
+def _parse_task_list(raw: str) -> List[str]:
+    return [item.strip() for item in raw.split(',') if item.strip()]
+
+
 def _load_user_config() -> Dict[str, Any]:
     config_path = os.environ.get('QWEN3VL_AUX_CONFIG_PATH')
     config_raw = os.environ.get('QWEN3VL_AUX_CONFIG')
@@ -38,12 +42,14 @@ def get_aux_head_lr(default_lr: float) -> float:
 def build_aux_config(target_model) -> Dict[str, Any]:
     text_config = getattr(target_model.config, 'text_config', target_model.config)
     hidden_size = getattr(text_config, 'hidden_size', None) or getattr(target_model.config, 'hidden_size')
+    enabled_tasks_env = set(_parse_task_list(os.environ.get('QWEN3VL_AUX_ENABLED_TASKS', '')))
     base_config: Dict[str, Any] = {
         'shared': {
             'hidden_size': hidden_size,
             'layer_indices': _parse_int_list(os.environ.get('QWEN3VL_AUX_HIDDEN_LAYERS', '6,13,20,27')),
             'merge_size': int(os.environ.get('QWEN3VL_AUX_MERGE_SIZE', os.environ.get('SPATIAL_MERGE_SIZE', '2'))),
             'lm_loss_weight': float(os.environ.get('QWEN3VL_AUX_LM_WEIGHT', '1.0')),
+            'enabled_tasks': list(enabled_tasks_env) if enabled_tasks_env else list(AUX_TASKS),
             'label_loader': {
                 'path_key': os.environ.get('QWEN3VL_AUX_LABEL_PATH_KEY', 'labels_path'),
                 'format': os.environ.get('QWEN3VL_AUX_LABEL_FORMAT', 'mspack'),
@@ -60,7 +66,7 @@ def build_aux_config(target_model) -> Dict[str, Any]:
     }
     for task in AUX_TASKS:
         base_config['tasks'][task] = {
-            'enabled': True,
+            'enabled': task in enabled_tasks_env if enabled_tasks_env else True,
             'label_key': f'y_{task}',
             'label_keys': [],
             'loss_weight': float(os.environ.get(f'QWEN3VL_{task.upper()}_LOSS_WEIGHT', '1.0')),
@@ -75,6 +81,11 @@ def build_aux_config(target_model) -> Dict[str, Any]:
 
     user_config = _load_user_config()
     merged = _deep_update(copy.deepcopy(base_config), user_config)
+    enabled_tasks = merged.get('shared', {}).get('enabled_tasks')
+    if enabled_tasks:
+        enabled_set = set(enabled_tasks)
+        for task in AUX_TASKS:
+            merged['tasks'][task]['enabled'] = task in enabled_set
     merged['layer_indices'] = list(merged['shared']['layer_indices'])
     merged['hidden_size'] = merged['shared']['hidden_size']
     return merged

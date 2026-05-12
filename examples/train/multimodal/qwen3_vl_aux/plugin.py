@@ -17,7 +17,6 @@ from aux_heads import AuxSeparateHeads
 from aux_losses import AuxSeparateLosses
 from common.config import AUX_TASKS, build_aux_config, get_aux_head_lr
 from common.label_loader import Qwen3VLAuxLabelLoader
-from common.visual_feature_extractor import Qwen3VLAuxFeatureExtractor
 from swift.llm import deep_getattr, get_multimodal_target_regex
 from swift.plugin import Tuner, extra_tuners, loss_mapping, optimizers_map
 from swift.plugin.loss import cross_entropy_loss_func
@@ -86,7 +85,6 @@ def _extract_loss_tensor(loss_output: Any, task: str) -> Optional[torch.Tensor]:
 
 
 def _attach_task_modules(target_model: nn.Module, aux_config: Dict[str, object]) -> None:
-    target_model.aux_feature_extractor = Qwen3VLAuxFeatureExtractor(aux_config)
     target_model.aux_label_loader = Qwen3VLAuxLabelLoader(aux_config)
     target_model.aux_heads = AuxSeparateHeads(aux_config)
     target_model.aux_losses = AuxSeparateLosses(aux_config)
@@ -129,18 +127,12 @@ def attach_auxiliary_modules(model: nn.Module, aux_config: Optional[Dict[str, ob
         if input_ids is None:
             return outputs
 
-        aux_features = self.aux_feature_extractor(
-            model_outputs=outputs,
-            input_ids=input_ids,
-            model_config=self.config,
-            image_grid_thw=kwargs.get('image_grid_thw'),
-            video_grid_thw=kwargs.get('video_grid_thw'),
-        )
-        if aux_features is None:
+        hidden_states = getattr(outputs, 'hidden_states', None)
+        if not hidden_states:
             return outputs
 
-        outputs.aux_features = aux_features
-        outputs.visual_hidden_state_layers = aux_features['layer_indices']
+        outputs.aux_features = {'hidden_states': hidden_states}
+        outputs.visual_hidden_state_layers = list(self.aux_head_config['shared'].get('layer_indices', []))
         outputs.aux_enabled_tasks = list(active_tasks)
         outputs.aux_loss_weights = {
             task: self.aux_head_config['tasks'][task]['loss_weight'] for task in active_tasks
@@ -151,24 +143,31 @@ def attach_auxiliary_modules(model: nn.Module, aux_config: Optional[Dict[str, ob
             batch_size=input_ids.shape[0],
             batch_kwargs=extra_label_inputs,
             raw_targets=raw_targets,
-            device=aux_features.get('device'),
+            device=hidden_states[-1].device,
         )
         outputs.aux_labels = aux_labels
 
+        try:
+            head_outputs = self.aux_heads(
+                aux_labels.get('batched_shared_labels'),
+                {'hidden_states': hidden_states},
+            )
+        except NotImplementedError as exc:
+            raise NotImplementedError(
+                'The auxiliary head stack is still an interface stub. '
+                'Please implement the required head or upsampler components.') from exc
+        if isinstance(head_outputs, list):
+            if not head_outputs:
+                return outputs
+            head_outputs = head_outputs[0]
+        if not isinstance(head_outputs, Mapping):
+            raise TypeError(f'AuxSeparateHeads must return a mapping or a single-item list, got {type(head_outputs)!r}.')
+        outputs.aux_head_outputs = head_outputs
+
         for task in active_tasks:
-            try:
-                prediction = self.aux_heads(
-                    task,
-                    aux_features=aux_features,
-                    aux_labels=aux_labels,
-                    model_outputs=outputs,
-                    task_cfg=self.aux_head_config['tasks'][task],
-                    shared_cfg=self.aux_head_config['shared'],
-                )
-            except NotImplementedError as exc:
-                raise NotImplementedError(
-                    f'The auxiliary head for task "{task}" is still an interface stub. '
-                    f'Please implement {task.title()}AuxHead.forward(...).') from exc
+            prediction = head_outputs.get(f'{task}_aux_head_output')
+            if prediction is None:
+                continue
             outputs.aux_predictions[task] = prediction
             setattr(outputs, f'{task}_prediction', prediction)
 
@@ -178,7 +177,7 @@ def attach_auxiliary_modules(model: nn.Module, aux_config: Optional[Dict[str, ob
                     predictions=prediction,
                     targets=aux_labels['task_targets'][task],
                     aux_labels=aux_labels,
-                    aux_features=aux_features,
+                    aux_features=outputs.aux_features,
                     model_outputs=outputs,
                     task_cfg=self.aux_head_config['tasks'][task],
                     shared_cfg=self.aux_head_config['shared'],

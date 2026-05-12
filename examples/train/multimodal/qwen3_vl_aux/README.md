@@ -17,16 +17,16 @@
   - 注册 `loss_type=qwen3vl_aux`
   - 注册 `optimizer=qwen3vl_aux`
   - patch `Qwen3-VL` forward，强制返回 `hidden_states`
-  - 调用公共 `feature_extractor`
   - 调用公共 `label_loader`
-  - 只分发启用中的辅助任务
+  - 一次性调用 `AuxSeparateHeads`
+  - 再按 task 拆分 `bev/god/cog` 的 loss
 - `common/`
   - `label_loader.py`
     - 负责把 `labels_path` 或 task-specific 路径懒加载成实际 label 对象
     - 负责把 numpy / dict / list 递归整理成 batch 级结构
-  - `visual_feature_extractor.py`
-    - 负责从 Qwen3-VL 输出中抽取视觉 hidden states
-    - 负责按 image/video token span 重组媒体级输入
+  - `token_feature_adapter.py`
+    - 负责从 `hidden_states` 拆分 `pv / bev / navi` token
+    - 负责把 BEV token 还原成后续 upsampler 需要的融合特征
   - `vggt_upsampler.py`
     - 提供 `VGGTUpsampler` 接口
     - 由 `AuxSeparateHeads` 在 task head 前统一调用
@@ -34,7 +34,8 @@
     - 负责统一加载辅助任务参数
 - `aux_heads.py`
   - 和 `plugin.py` 同层
-  - 统一管理三类 head 的注册、启停和 upsampler 接线
+  - 保留原始的多任务总控式 `AuxSeparateHeads`
+  - 内部统一完成 token 拆分、upsampler、各 task head 前向
 - `aux_losses.py`
   - 和 `plugin.py` 同层
   - 统一管理三类 loss 的注册和 task-specific payload 包装
@@ -49,8 +50,9 @@
 对于每个辅助任务，当前默认结构是：
 
 ```text
-selected hidden states [6,13,20,27]
-    -> feature extractor
+Qwen3-VL hidden_states
+    -> token_feature_adapter
+    -> AuxSeparateHeads
     -> VGGTUpsampler
     -> task-specific AuxHead
     -> predictions
@@ -88,7 +90,7 @@ L = L_lm
 
 - 在 `plugin.py` 的 `forward` 中调用 `common/label_loader.py`
 - 默认按 `labels[2][0]` 取出 `src_label`
-- 再按各 task 的 `label_keys` 从 `src_label` 里取需要的字段
+- 再把 batched label 直接传给 `AuxSeparateHeads` 和各 task loss
 
 ## 关键参数
 
@@ -114,6 +116,9 @@ L = L_lm
   - 推荐通过一个 JSON 文件集中传辅助任务参数
 - `QWEN3VL_AUX_CONFIG`
   - 也支持直接传 JSON 字符串，更适合临时调试
+- `QWEN3VL_AUX_ENABLED_TASKS`
+  - 可选，逗号分隔，比如 `bev,god`
+  - 不传时默认按 `tasks.<name>.enabled` 配置生效
 - `QWEN3VL_AUX_LABEL_PATH_KEY`
   - 默认 `labels_path`
 - `QWEN3VL_AUX_LABEL_FORMAT`
@@ -126,6 +131,7 @@ L = L_lm
 ```json
 {
   "shared": {
+    "enabled_tasks": ["bev", "god"],
     "layer_indices": [6, 13, 20, 27],
     "merge_size": 2,
     "lm_loss_weight": 1.0,
@@ -136,6 +142,7 @@ L = L_lm
       "cache_size": 256
     },
     "upsampler_cfg": {
+      "type": "updeconv",
       "patch_size": 32,
       "features": 256,
       "out_channels": [256, 512, 1024, 1024]
@@ -173,6 +180,7 @@ L = L_lm
 这种传法更合适，因为：
 
 - shared 参数只写一次，比如 `layer_indices / merge_size / upsampler_cfg`
+- 可以在 `shared.enabled_tasks` 或 `QWEN3VL_AUX_ENABLED_TASKS` 里统一指定本次启用哪些任务
 - 每个任务只维护自己的 `label_key / label_keys / loss_weight / head / loss`
 - 可以用 `enabled=false` 临时关闭还没实现完的任务，比如当前先跳过 `cog`
 - plugin 不需要为了新任务参数继续扩展新的环境变量
@@ -180,7 +188,7 @@ L = L_lm
 ## 当前边界
 
 - 当前 `AuxHead` / `AuxLoss` 已经改成接口骨架，本仓库里不包含你的具体任务实现
-- 当前 `VGGTUpsampler` 也是接口骨架，但调用位置已经固定在 `AuxSeparateHeads`
+- 当前 `VGGTUpsampler` 仍然是接口骨架，但构造方式已经兼容原始 `AuxSeparateHeads`
 - 当前实现优先保证单图 / 单视频 / 多媒体顺序输入可跑通
 - 你后续只需要补齐这几个接口的具体实现：
   - `aux_task/bev/bev_aux_head.py`, `aux_task/bev/bev_aux_loss.py`
