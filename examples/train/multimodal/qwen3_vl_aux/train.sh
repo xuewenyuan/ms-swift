@@ -5,7 +5,6 @@ swift sft \
     --model Qwen/Qwen3-VL-4B-Instruct \
     --dataset /path/to/your_train.jsonl \
     --external_plugins examples/train/multimodal/qwen3_vl_aux/plugin.py \
-    --custom_register_path examples/train/multimodal/qwen3_vl_aux/dataset.py \
     --torch_dtype bfloat16 \
     --train_type qwen3vl_aux \
     --loss_type qwen3vl_aux \
