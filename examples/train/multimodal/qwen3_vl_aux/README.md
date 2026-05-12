@@ -18,24 +18,26 @@
   - 注册 `optimizer=qwen3vl_aux`
   - patch `Qwen3-VL` forward，强制返回 `hidden_states`
   - 调用公共 `feature_extractor`
-  - 将视觉特征和任务配置转交给 `AuxHead/AuxLoss`
+  - 调用公共 `label_loader`
+  - 只分发启用中的辅助任务
 - `common/`
   - `label_loader.py`
     - 负责把 `labels_path` 或 task-specific 路径懒加载成实际 label 对象
+    - 负责把 numpy / dict / list 递归整理成 batch 级结构
   - `visual_feature_extractor.py`
     - 负责从 Qwen3-VL 输出中抽取视觉 hidden states
     - 负责按 image/video token span 重组媒体级输入
   - `vggt_upsampler.py`
     - 提供 `VGGTUpsampler` 接口
-    - 后续由 `AuxSeparateHeads` 内部调用
+    - 由 `AuxSeparateHeads` 在 task head 前统一调用
   - `config.py`
     - 负责统一加载辅助任务参数
 - `aux_heads.py`
   - 和 `plugin.py` 同层
-  - 统一管理三类 head 的注册和分发
+  - 统一管理三类 head 的注册、启停和 upsampler 接线
 - `aux_losses.py`
   - 和 `plugin.py` 同层
-  - 统一管理三类 loss 的注册和分发
+  - 统一管理三类 loss 的注册和 task-specific payload 包装
 - `aux_task/`
   - 按任务拆分 `bev / cog / god`
   - 每个任务目录下放自己的 `AuxHead` 和 `AuxLoss`
@@ -49,9 +51,10 @@
 ```text
 selected hidden states [6,13,20,27]
     -> feature extractor
-    -> label loader
-    -> task-specific AuxHead (internally calls VGGTUpsampler)
+    -> VGGTUpsampler
+    -> task-specific AuxHead
     -> predictions
+    -> label loader
     -> task-specific AuxLoss
 ```
 
@@ -140,6 +143,7 @@ L = L_lm
   },
   "tasks": {
     "bev": {
+      "enabled": true,
       "label_key": "y_bev",
       "label_keys": [],
       "loss_weight": 1.0,
@@ -147,6 +151,7 @@ L = L_lm
       "loss": {}
     },
     "cog": {
+      "enabled": false,
       "label_key": "y_cog",
       "label_keys": [],
       "loss_weight": 1.0,
@@ -154,6 +159,7 @@ L = L_lm
       "loss": {}
     },
     "god": {
+      "enabled": true,
       "label_key": "y_god",
       "label_keys": [],
       "loss_weight": 1.0,
@@ -168,12 +174,13 @@ L = L_lm
 
 - shared 参数只写一次，比如 `layer_indices / merge_size / upsampler_cfg`
 - 每个任务只维护自己的 `label_key / label_keys / loss_weight / head / loss`
+- 可以用 `enabled=false` 临时关闭还没实现完的任务，比如当前先跳过 `cog`
 - plugin 不需要为了新任务参数继续扩展新的环境变量
 
 ## 当前边界
 
 - 当前 `AuxHead` / `AuxLoss` 已经改成接口骨架，本仓库里不包含你的具体任务实现
-- 当前 `VGGTUpsampler` 也是接口骨架，具体实现由 `AuxSeparateHeads` 内部接入
+- 当前 `VGGTUpsampler` 也是接口骨架，但调用位置已经固定在 `AuxSeparateHeads`
 - 当前实现优先保证单图 / 单视频 / 多媒体顺序输入可跑通
 - 你后续只需要补齐这几个接口的具体实现：
   - `aux_task/bev/bev_aux_head.py`, `aux_task/bev/bev_aux_loss.py`

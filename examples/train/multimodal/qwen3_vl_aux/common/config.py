@@ -60,6 +60,7 @@ def build_aux_config(target_model) -> Dict[str, Any]:
     }
     for task in AUX_TASKS:
         base_config['tasks'][task] = {
+            'enabled': True,
             'label_key': f'y_{task}',
             'label_keys': [],
             'loss_weight': float(os.environ.get(f'QWEN3VL_{task.upper()}_LOSS_WEIGHT', '1.0')),

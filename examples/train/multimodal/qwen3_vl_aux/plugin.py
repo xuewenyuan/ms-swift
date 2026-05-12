@@ -50,6 +50,11 @@ def _is_aux_parameter_name(name: str) -> bool:
     return any(keyword in name for keyword in AUX_MODULE_KEYWORDS)
 
 
+def _get_active_tasks(aux_config: Dict[str, object]) -> Sequence[str]:
+    tasks_cfg = aux_config.get('tasks', {})
+    return [task for task in AUX_TASKS if tasks_cfg.get(task, {}).get('enabled', True)]
+
+
 def _get_target_model(model: nn.Module) -> nn.Module:
     current = model
     visited = set()
@@ -99,12 +104,13 @@ def attach_auxiliary_modules(model: nn.Module, aux_config: Optional[Dict[str, ob
     origin_forward = target_model.forward
 
     def forward(self, *args, y_bev=None, y_cog=None, y_god=None, **kwargs):
+        active_tasks = _get_active_tasks(self.aux_head_config)
         extra_task_targets = {}
         extra_label_inputs = {}
         path_key = self.aux_head_config['shared'].get('label_loader', {}).get('path_key', 'labels_path')
         if path_key in kwargs:
             extra_label_inputs[path_key] = kwargs.pop(path_key)
-        for task in AUX_TASKS:
+        for task in active_tasks:
             label_key = self.aux_head_config['tasks'][task]['label_key']
             if label_key not in {'y_bev', 'y_cog', 'y_god'} and label_key in kwargs:
                 extra_task_targets[task] = kwargs.pop(label_key)
@@ -135,16 +141,21 @@ def attach_auxiliary_modules(model: nn.Module, aux_config: Optional[Dict[str, ob
 
         outputs.aux_features = aux_features
         outputs.visual_hidden_state_layers = aux_features['layer_indices']
+        outputs.aux_enabled_tasks = list(active_tasks)
         outputs.aux_loss_weights = {
-            task: self.aux_head_config['tasks'][task]['loss_weight'] for task in AUX_TASKS
+            task: self.aux_head_config['tasks'][task]['loss_weight'] for task in active_tasks
         }
         raw_targets = {'bev': y_bev, 'cog': y_cog, 'god': y_god}
         raw_targets.update(extra_task_targets)
         aux_labels = self.aux_label_loader(
-            batch_size=input_ids.shape[0], batch_kwargs=extra_label_inputs, raw_targets=raw_targets)
+            batch_size=input_ids.shape[0],
+            batch_kwargs=extra_label_inputs,
+            raw_targets=raw_targets,
+            device=aux_features.get('device'),
+        )
         outputs.aux_labels = aux_labels
 
-        for task in AUX_TASKS:
+        for task in active_tasks:
             try:
                 prediction = self.aux_heads(
                     task,

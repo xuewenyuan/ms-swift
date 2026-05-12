@@ -5,6 +5,7 @@ from typing import Any, Dict, List, Optional, Sequence
 import json
 
 import numpy as np
+import torch
 
 try:
     import msgpack
@@ -47,6 +48,72 @@ def _resolve_data_path(data: Any, path_spec: Sequence[Any]) -> Any:
     for key in path_spec:
         current = current[key]
     return current
+
+
+def _collate_nested(values: List[Any]) -> Any:
+    filtered = [value for value in values if value is not None]
+    if not filtered:
+        return None
+
+    first = filtered[0]
+    if isinstance(first, torch.Tensor):
+        if len(filtered) != len(values):
+            return values
+        try:
+            return torch.stack(values)
+        except Exception:
+            return values
+
+    if isinstance(first, np.ndarray):
+        if len(filtered) != len(values):
+            return values
+        try:
+            return torch.from_numpy(np.stack(values))
+        except Exception:
+            return values
+
+    if isinstance(first, dict):
+        keys = set()
+        for value in filtered:
+            keys.update(value.keys())
+        return {
+            key: _collate_nested([value.get(key) if isinstance(value, dict) else None for value in values])
+            for key in sorted(keys)
+        }
+
+    if isinstance(first, (list, tuple)):
+        max_len = max(len(value) for value in filtered)
+        collated = [
+            _collate_nested([
+                value[index] if isinstance(value, (list, tuple)) and index < len(value) else None for value in values
+            ]) for index in range(max_len)
+        ]
+        return tuple(collated) if isinstance(first, tuple) else collated
+
+    if isinstance(first, (bool, np.bool_)):
+        return torch.tensor([bool(value) if value is not None else False for value in values], dtype=torch.bool)
+
+    if isinstance(first, (int, np.integer)):
+        return torch.tensor([int(value) if value is not None else 0 for value in values], dtype=torch.long)
+
+    if isinstance(first, (float, np.floating)):
+        return torch.tensor([float(value) if value is not None else 0.0 for value in values], dtype=torch.float32)
+
+    return values
+
+
+def _move_to_device(value: Any, device: Optional[torch.device]) -> Any:
+    if device is None:
+        return value
+    if isinstance(value, torch.Tensor):
+        return value.to(device=device)
+    if isinstance(value, dict):
+        return {key: _move_to_device(item, device) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_move_to_device(item, device) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_move_to_device(item, device) for item in value)
+    return value
 
 
 class Qwen3VLAuxLabelLoader:
@@ -177,7 +244,7 @@ class Qwen3VLAuxLabelLoader:
         for task, task_cfg in self.cfg['tasks'].items():
             label_keys = task_cfg.get('label_keys') or []
             if not label_keys:
-                views[task] = [None for _ in shared_labels]
+                views[task] = shared_labels
                 continue
             task_values = []
             for label_obj in shared_labels:
@@ -188,14 +255,33 @@ class Qwen3VLAuxLabelLoader:
             views[task] = task_values
         return views
 
-    def __call__(self, *, batch_size: int, batch_kwargs: Dict[str, Any], raw_targets: Dict[str, Any]) -> Dict[str, Any]:
+    def __call__(
+        self,
+        *,
+        batch_size: int,
+        batch_kwargs: Dict[str, Any],
+        raw_targets: Dict[str, Any],
+        device: Optional[torch.device] = None,
+    ) -> Dict[str, Any]:
         shared_labels = self._resolve_shared_labels(batch_kwargs, batch_size)
+        task_label_views = self._build_task_label_views(shared_labels)
         resolved_targets = {
             task: self._resolve_task_target(raw_targets.get(task), batch_size) for task in self.cfg['tasks']
         }
+        batched_shared_labels = _move_to_device(_collate_nested(shared_labels), device)
+        batched_task_views = {
+            task: _move_to_device(_collate_nested(task_values), device) for task, task_values in task_label_views.items()
+        }
+        batched_targets = {}
+        for task, task_values in resolved_targets.items():
+            if any(value is not None for value in task_values):
+                batched_targets[task] = _move_to_device(_collate_nested(task_values), device)
+            else:
+                batched_targets[task] = batched_task_views.get(task)
         return {
             'path_key': self.path_key,
             'shared_labels': shared_labels,
-            'task_targets': resolved_targets,
-            'task_label_views': self._build_task_label_views(shared_labels),
+            'batched_shared_labels': batched_shared_labels,
+            'task_targets': batched_targets,
+            'task_label_views': batched_task_views,
         }

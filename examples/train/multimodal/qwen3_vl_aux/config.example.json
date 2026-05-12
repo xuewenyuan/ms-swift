@@ -17,6 +17,7 @@
   },
   "tasks": {
     "bev": {
+      "enabled": true,
       "label_key": "y_bev",
       "label_keys": [],
       "loss_weight": 1.0,
@@ -26,6 +27,7 @@
       "loss": {}
     },
     "cog": {
+      "enabled": false,
       "label_key": "y_cog",
       "label_keys": [],
       "loss_weight": 1.0,
@@ -35,6 +37,7 @@
       "loss": {}
     },
     "god": {
+      "enabled": true,
       "label_key": "y_god",
       "label_keys": [],
       "loss_weight": 1.0,
