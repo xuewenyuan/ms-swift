@@ -3,6 +3,12 @@
     "layer_indices": [6, 13, 20, 27],
     "merge_size": 2,
     "lm_loss_weight": 1.0,
+    "label_loader": {
+      "path_key": "labels_path",
+      "format": "mspack",
+      "src_label_path": [2, 0],
+      "cache_size": 256
+    },
     "upsampler_cfg": {
       "patch_size": 32,
       "features": 256,
@@ -12,6 +18,7 @@
   "tasks": {
     "bev": {
       "label_key": "y_bev",
+      "label_keys": [],
       "loss_weight": 1.0,
       "head": {
         "num_classes": 2
@@ -20,6 +27,7 @@
     },
     "cog": {
       "label_key": "y_cog",
+      "label_keys": [],
       "loss_weight": 1.0,
       "head": {
         "num_classes": 2
@@ -28,6 +36,7 @@
     },
     "god": {
       "label_key": "y_god",
+      "label_keys": [],
       "loss_weight": 1.0,
       "head": {
         "num_classes": 2

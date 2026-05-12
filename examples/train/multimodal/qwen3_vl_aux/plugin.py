@@ -16,6 +16,7 @@ if PLUGIN_DIR not in sys.path:
 from aux_heads import AuxSeparateHeads
 from aux_losses import AuxSeparateLosses
 from common.config import AUX_TASKS, build_aux_config, get_aux_head_lr
+from common.label_loader import Qwen3VLAuxLabelLoader
 from common.visual_feature_extractor import Qwen3VLAuxFeatureExtractor
 from swift.llm import deep_getattr, get_multimodal_target_regex
 from swift.plugin import Tuner, extra_tuners, loss_mapping, optimizers_map
@@ -63,26 +64,6 @@ def _get_target_model(model: nn.Module) -> nn.Module:
     return model
 
 
-def _normalize_task_target(value: Any, device: torch.device) -> Any:
-    if value is None:
-        return None
-    if isinstance(value, torch.Tensor):
-        return value.to(device=device)
-    if isinstance(value, dict):
-        return {key: _normalize_task_target(item, device) for key, item in value.items()}
-    if isinstance(value, tuple):
-        return tuple(_normalize_task_target(item, device) for item in value)
-    if isinstance(value, list):
-        try:
-            return torch.as_tensor(value, device=device)
-        except (TypeError, ValueError):
-            return [_normalize_task_target(item, device) for item in value]
-    try:
-        return torch.as_tensor(value, device=device)
-    except (TypeError, ValueError):
-        return value
-
-
 def _extract_loss_tensor(loss_output: Any, task: str) -> Optional[torch.Tensor]:
     if loss_output is None:
         return None
@@ -101,6 +82,7 @@ def _extract_loss_tensor(loss_output: Any, task: str) -> Optional[torch.Tensor]:
 
 def _attach_task_modules(target_model: nn.Module, aux_config: Dict[str, object]) -> None:
     target_model.aux_feature_extractor = Qwen3VLAuxFeatureExtractor(aux_config)
+    target_model.aux_label_loader = Qwen3VLAuxLabelLoader(aux_config)
     target_model.aux_heads = AuxSeparateHeads(aux_config)
     target_model.aux_losses = AuxSeparateLosses(aux_config)
     target_model.aux_head_config = aux_config
@@ -118,6 +100,10 @@ def attach_auxiliary_modules(model: nn.Module, aux_config: Optional[Dict[str, ob
 
     def forward(self, *args, y_bev=None, y_cog=None, y_god=None, **kwargs):
         extra_task_targets = {}
+        extra_label_inputs = {}
+        path_key = self.aux_head_config['shared'].get('label_loader', {}).get('path_key', 'labels_path')
+        if path_key in kwargs:
+            extra_label_inputs[path_key] = kwargs.pop(path_key)
         for task in AUX_TASKS:
             label_key = self.aux_head_config['tasks'][task]['label_key']
             if label_key not in {'y_bev', 'y_cog', 'y_god'} and label_key in kwargs:
@@ -154,15 +140,16 @@ def attach_auxiliary_modules(model: nn.Module, aux_config: Optional[Dict[str, ob
         }
         raw_targets = {'bev': y_bev, 'cog': y_cog, 'god': y_god}
         raw_targets.update(extra_task_targets)
-        targets = {
-            task: _normalize_task_target(raw_targets[task], aux_features['device']) for task in AUX_TASKS
-        }
+        aux_labels = self.aux_label_loader(
+            batch_size=input_ids.shape[0], batch_kwargs=extra_label_inputs, raw_targets=raw_targets)
+        outputs.aux_labels = aux_labels
 
         for task in AUX_TASKS:
             try:
                 prediction = self.aux_heads(
                     task,
                     aux_features=aux_features,
+                    aux_labels=aux_labels,
                     model_outputs=outputs,
                     task_cfg=self.aux_head_config['tasks'][task],
                     shared_cfg=self.aux_head_config['shared'],
@@ -178,7 +165,8 @@ def attach_auxiliary_modules(model: nn.Module, aux_config: Optional[Dict[str, ob
                 loss_output = self.aux_losses(
                     task,
                     predictions=prediction,
-                    targets=targets[task],
+                    targets=aux_labels['task_targets'][task],
+                    aux_labels=aux_labels,
                     aux_features=aux_features,
                     model_outputs=outputs,
                     task_cfg=self.aux_head_config['tasks'][task],

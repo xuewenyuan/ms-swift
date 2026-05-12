@@ -11,6 +11,9 @@ LABEL_MAPPING = {
     'label_bev': 'y_bev',
     'label_cog': 'y_cog',
     'label_god': 'y_god',
+    'label_path': 'labels_path',
+    'src_label_path': 'labels_path',
+    'labels_file': 'labels_path',
 }
 
 
@@ -25,6 +28,8 @@ class Qwen3VLAuxPreprocessor(ResponsePreprocessor):
         for key in ['y_bev', 'y_cog', 'y_god']:
             if key in row:
                 aux_labels[key] = row.pop(key)
+        if 'labels_path' in row:
+            aux_labels['labels_path'] = row.pop('labels_path')
 
         row = super().preprocess(row)
         if row is None:

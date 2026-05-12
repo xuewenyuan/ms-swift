@@ -5,6 +5,7 @@
 - 主输入：`text prompt + image/video`
 - 主文本监督：`y_action`, `y_traj`
 - 辅助监督：`y_bev`, `y_cog`, `y_god`
+- 辅助标签可以直接放对象，也可以放一个地址字段再懒加载
 - 从 Qwen3-VL 的 LLM 视觉 hidden states 取 4 层：`[6, 13, 20, 27]`
 - 每个辅助任务各自一套 `VGGT-style DPTHead + AuxHead + AuxLoss`
 - 通过 `external_plugins` / `custom_register_path` 接入，不修改 `ms-swift` 核心训练框架
@@ -19,6 +20,8 @@
   - 调用公共 `feature_extractor`
   - 将视觉特征和任务配置转交给 `AuxHead/AuxLoss`
 - `common/`
+  - `label_loader.py`
+    - 负责把 `labels_path` 或 task-specific 路径懒加载成实际 label 对象
   - `visual_feature_extractor.py`
     - 负责从 Qwen3-VL 输出中抽取视觉 hidden states
     - 负责按 image/video token span 重组媒体级输入
@@ -50,6 +53,7 @@
 ```text
 selected hidden states [6,13,20,27]
     -> feature extractor
+    -> label loader
     -> task-specific AuxHead (internally calls VGGTUpsampler)
     -> predictions
     -> task-specific AuxLoss
@@ -74,6 +78,19 @@ L = L_lm
 {"messages": [{"role": "user", "content": "<image>请输出 action 和 trajectory"}, {"role": "assistant", "content": "action: ... trajectory: ..."}], "images": ["/abs/path/a.jpg"], "y_bev": 1, "y_cog": 0, "y_god": 2}
 {"messages": [{"role": "user", "content": "<video>请输出 action 和 trajectory"}, {"role": "assistant", "content": "action: ... trajectory: ..."}], "videos": ["/abs/path/a.mp4"], "y_bev": 0, "y_cog": 1, "y_god": 1}
 ```
+
+如果你的辅助标签在外部文件里，更推荐这样：
+
+```jsonl
+{"messages": [{"role": "user", "content": "<image>请输出 action 和 trajectory"}, {"role": "assistant", "content": "action: ... trajectory: ..."}], "images": ["/abs/path/a.jpg"], "labels_path": "obs://.../labels.zstd.mspack"}
+```
+
+这时训练时会：
+
+- 在 `dataset.py` 中保留 `labels_path`
+- 在 `plugin.py` 的 `forward` 中调用 `common/label_loader.py`
+- 默认按 `labels[2][0]` 取出 `src_label`
+- 再按各 task 的 `label_keys` 从 `src_label` 里取需要的字段
 
 如果你的列名不是 `y_bev/y_cog/y_god`，也可以先用：
 
@@ -107,6 +124,12 @@ god_label -> y_god
   - 推荐通过一个 JSON 文件集中传辅助任务参数
 - `QWEN3VL_AUX_CONFIG`
   - 也支持直接传 JSON 字符串，更适合临时调试
+- `QWEN3VL_AUX_LABEL_PATH_KEY`
+  - 默认 `labels_path`
+- `QWEN3VL_AUX_LABEL_FORMAT`
+  - 默认 `mspack`
+- `QWEN3VL_AUX_LABEL_CACHE_SIZE`
+  - 默认 `256`
 
 推荐把辅助任务参数分成两层：
 
@@ -116,6 +139,12 @@ god_label -> y_god
     "layer_indices": [6, 13, 20, 27],
     "merge_size": 2,
     "lm_loss_weight": 1.0,
+    "label_loader": {
+      "path_key": "labels_path",
+      "format": "mspack",
+      "src_label_path": [2, 0],
+      "cache_size": 256
+    },
     "upsampler_cfg": {
       "patch_size": 32,
       "features": 256,
@@ -125,18 +154,21 @@ god_label -> y_god
   "tasks": {
     "bev": {
       "label_key": "y_bev",
+      "label_keys": [],
       "loss_weight": 1.0,
       "head": {},
       "loss": {}
     },
     "cog": {
       "label_key": "y_cog",
+      "label_keys": [],
       "loss_weight": 1.0,
       "head": {},
       "loss": {}
     },
     "god": {
       "label_key": "y_god",
+      "label_keys": [],
       "loss_weight": 1.0,
       "head": {},
       "loss": {}
@@ -148,7 +180,7 @@ god_label -> y_god
 这种传法更合适，因为：
 
 - shared 参数只写一次，比如 `layer_indices / merge_size / upsampler_cfg`
-- 每个任务只维护自己的 `label_key / loss_weight / head / loss`
+- 每个任务只维护自己的 `label_key / label_keys / loss_weight / head / loss`
 - plugin 不需要为了新任务参数继续扩展新的环境变量
 
 ## 当前边界
