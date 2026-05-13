@@ -130,6 +130,9 @@ def attach_auxiliary_modules(model: nn.Module, aux_config: Optional[Dict[str, ob
         hidden_states = getattr(outputs, 'hidden_states', None)
         if not hidden_states:
             return outputs
+        image_grid_thw = kwargs.get('image_grid_thw')
+        if image_grid_thw is None:
+            return outputs
 
         outputs.aux_features = {'hidden_states': hidden_states}
         outputs.visual_hidden_state_layers = list(self.aux_head_config['shared'].get('layer_indices', []))
@@ -150,7 +153,12 @@ def attach_auxiliary_modules(model: nn.Module, aux_config: Optional[Dict[str, ob
         try:
             head_outputs = self.aux_heads(
                 aux_labels.get('batched_shared_labels'),
-                {'hidden_states': hidden_states},
+                {
+                    'hidden_states': hidden_states,
+                    'input_ids': input_ids,
+                    'image_grid_thw': image_grid_thw,
+                    'model_config': self.config,
+                },
             )
         except NotImplementedError as exc:
             raise NotImplementedError(

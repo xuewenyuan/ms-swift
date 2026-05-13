@@ -89,17 +89,14 @@ class AuxSeparateHeads(nn.Module):
         self._auto_init()
         if 'bev' in self.task_heads and hasattr(self.task_heads['bev'], 'init_heatmap_weights'):
             self.task_heads['bev'].init_heatmap_weights()
-        self.pv_token_len = cfg.get('pv_token_len', 740)
-        self.bev_token_len = cfg.get('bev_token_len', 504)
-        self.navi_token_len = cfg.get('navi_token_len', 32)
         self.token_feature_adapter = Qwen3VLAuxTokenFeatureAdapter(
-            bev_area=self.bev_area,
-            foundation_resolution=self.foundation_resolution,
-            pv_token_len=self.pv_token_len,
-            bev_token_len=self.bev_token_len,
-            navi_token_len=self.navi_token_len,
             intermediate_layer_idx=self.intermediate_layer_idx,
+            merge_size=_get_nested(cfg, 'shared', 'merge_size', default=2),
         )
+        # Historical fixed token-length slicing is intentionally no longer used.
+        # self.pv_token_len = cfg.get('pv_token_len', 740)
+        # self.bev_token_len = cfg.get('bev_token_len', 504)
+        # self.navi_token_len = cfg.get('navi_token_len', 32)
 
     def _auto_init(self):
         pass
@@ -126,7 +123,11 @@ class AuxSeparateHeads(nn.Module):
     def forward(self, *inputs, **kwargs):
         payload = self.token_feature_adapter.normalize_head_inputs(inputs)
         hidden_state_payload, fusion_feat, height, width = self.token_feature_adapter.build_fusion_features(
-            payload['hidden_states'])
+            payload['hidden_states'],
+            payload['input_ids'],
+            payload['image_grid_thw'],
+            payload['model_config'],
+        )
         batch_size = fusion_feat.shape[0]
 
         with timer.ticktock('-   unet'):
@@ -141,12 +142,12 @@ class AuxSeparateHeads(nn.Module):
             elif self.up_sample_type == 'vggt_upsampler':
                 images_template = torch.zeros(
                     (batch_size, 1, 3, int(height * self.scale), int(width * self.scale)),
-                    device=flatten_feat.device,
-                    dtype=flatten_feat.dtype,
+                    device=fusion_feat.device,
+                    dtype=fusion_feat.dtype,
                 )
                 for task, unet in self.unets.items():
                     unet_output = unet(
-                        hidden_state_payload['bev_tokens_list'],
+                        hidden_state_payload['image_tokens_list'],
                         images=images_template,
                         patch_start_idx=0,
                     )
