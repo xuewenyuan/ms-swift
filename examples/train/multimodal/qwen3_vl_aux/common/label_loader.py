@@ -1,6 +1,6 @@
 from collections import OrderedDict
 from io import BytesIO
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Set
 
 import json
 
@@ -102,6 +102,30 @@ def _collate_nested(values: List[Any]) -> Any:
     return values
 
 
+def _tensorize_nested(value: Any) -> Any:
+    if isinstance(value, torch.Tensor):
+        return value
+    if isinstance(value, np.ndarray):
+        return torch.from_numpy(value)
+    if isinstance(value, dict):
+        return {key: _tensorize_nested(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_tensorize_nested(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_tensorize_nested(item) for item in value)
+    if isinstance(value, (bool, np.bool_)):
+        return bool(value)
+    if isinstance(value, (int, np.integer)):
+        return int(value)
+    if isinstance(value, (float, np.floating)):
+        return float(value)
+    return value
+
+
+def _collate_preserving_samples(values: List[Any]) -> Any:
+    return [_tensorize_nested(value) for value in values]
+
+
 def _move_to_device(value: Any, device: Optional[torch.device]) -> Any:
     if device is None:
         return value
@@ -125,6 +149,8 @@ class Qwen3VLAuxLabelLoader:
         self.label_format = label_loader_cfg.get('format', 'mspack')
         self.src_label_path = label_loader_cfg.get('src_label_path', [2, 0])
         self.cache_size = int(label_loader_cfg.get('cache_size', 256))
+        preserve_keys = label_loader_cfg.get('preserve_sample_structure_keys', ['centerpoint_head_obj_white'])
+        self.preserve_sample_structure_keys: Set[str] = set(preserve_keys)
         self._cache: OrderedDict[str, Any] = OrderedDict()
         self._zstd = zstd.ZstdDecompressor() if zstd is not None else None
 
@@ -255,6 +281,22 @@ class Qwen3VLAuxLabelLoader:
             views[task] = task_values
         return views
 
+    def _collate_label_dict(self, values: List[Any]) -> Any:
+        filtered = [value for value in values if isinstance(value, dict)]
+        if not filtered:
+            return None
+        keys = set()
+        for value in filtered:
+            keys.update(value.keys())
+        collated = {}
+        for key in sorted(keys):
+            key_values = [value.get(key) if isinstance(value, dict) else None for value in values]
+            if key in self.preserve_sample_structure_keys:
+                collated[key] = _collate_preserving_samples(key_values)
+            else:
+                collated[key] = _collate_nested(key_values)
+        return collated
+
     def __call__(
         self,
         *,
@@ -268,9 +310,12 @@ class Qwen3VLAuxLabelLoader:
         resolved_targets = {
             task: self._resolve_task_target(raw_targets.get(task), batch_size) for task in self.cfg['tasks']
         }
-        batched_shared_labels = _move_to_device(_collate_nested(shared_labels), device)
+        batched_shared_labels = _move_to_device(self._collate_label_dict(shared_labels), device)
         batched_task_views = {
-            task: _move_to_device(_collate_nested(task_values), device) for task, task_values in task_label_views.items()
+            task: _move_to_device(self._collate_label_dict(task_values), device)
+            if task_values and all(isinstance(value, dict) or value is None for value in task_values)
+            else _move_to_device(_collate_nested(task_values), device)
+            for task, task_values in task_label_views.items()
         }
         batched_targets = {}
         for task, task_values in resolved_targets.items():
