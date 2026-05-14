@@ -3,6 +3,7 @@ from typing import Any, Dict, Mapping
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from aux_task.bev.bev_aux_head import BevAuxHead
 from aux_task.cog.cog_aux_head import CogAuxHead
@@ -69,6 +70,15 @@ class AuxSeparateHeads(nn.Module):
             _get_nested(cfg, 'shared', 'stage_dims',
                         default=upsampler_cfg.get('out_channels', cfg.get('stage_dims', [128, 256, 512, 1024]))))
         self.up_sample_type = upsampler_cfg.get('type', cfg.get('up_sample_type', 'updeconv'))
+        default_task_feature_shapes = {
+            'bev': [144, 56],
+            'god': [144, 56],
+        }
+        configured_task_feature_shapes = _get_nested(cfg, 'shared', 'task_feature_shapes', default={}) or {}
+        self.task_feature_shapes = {
+            task: tuple(configured_task_feature_shapes.get(task, default_task_feature_shapes.get(task, [])))
+            for task in self.active_tasks
+        }
 
         # Kept for parity with the original implementation. Re-enable if the
         # exported inference or cache-dump path is wired back in later.
@@ -102,6 +112,15 @@ class AuxSeparateHeads(nn.Module):
 
     def _auto_init(self):
         pass
+
+    def _resize_task_feature(self, task: str, feature: torch.Tensor) -> torch.Tensor:
+        target_shape = self.task_feature_shapes.get(task)
+        if not target_shape or len(target_shape) != 2:
+            return feature
+        target_hw = (int(target_shape[0]), int(target_shape[1]))
+        if feature.shape[-2:] == target_hw:
+            return feature
+        return F.interpolate(feature, size=target_hw, mode='bilinear', align_corners=True)
 
     def _build_unet(self, upsampler_cfg: Mapping[str, Any]) -> nn.Module:
         if self.up_sample_type == 'interpolate':
@@ -171,8 +190,9 @@ class AuxSeparateHeads(nn.Module):
 
         for task in self.active_tasks:
             head = self.task_heads[task]
+            head_input = self._resize_task_feature(task, unet_feats[task])
             with timer.ticktock(f'-   {task} aux head'):
-                task_output, task_feat = head(unet_feats[task])
+                task_output, task_feat = head(head_input)
             if task == 'cog':
                 task_output = {
                     key: value if 'cog_neck' in key else value[:, :, self.seg_crop_top:self.seg_crop_down,

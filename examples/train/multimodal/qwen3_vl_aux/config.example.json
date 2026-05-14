@@ -9,6 +9,10 @@
     "foundation_resolution": 3.2,
     "common_cog_area": [[-16.0, 95.4], [-22.4, 22.4]],
     "stage_dims": [128, 256, 512, 2048],
+    "task_feature_shapes": {
+      "bev": [144, 56],
+      "god": [144, 56]
+    },
     "label_loader": {
       "path_key": "labels_path",
       "format": "mspack",
