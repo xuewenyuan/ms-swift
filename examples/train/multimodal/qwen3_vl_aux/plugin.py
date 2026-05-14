@@ -69,6 +69,29 @@ def _get_target_model(model: nn.Module) -> nn.Module:
 
 
 def _extract_loss_tensor(loss_output: Any, task: str) -> Optional[torch.Tensor]:
+    def _sum_tensors(value: Any) -> Optional[torch.Tensor]:
+        if value is None:
+            return None
+        if isinstance(value, torch.Tensor):
+            return value
+        if isinstance(value, Mapping):
+            total = None
+            for nested in value.values():
+                tensor = _sum_tensors(nested)
+                if tensor is None:
+                    continue
+                total = tensor if total is None else total + tensor
+            return total
+        if isinstance(value, (list, tuple)):
+            total = None
+            for nested in value:
+                tensor = _sum_tensors(nested)
+                if tensor is None:
+                    continue
+                total = tensor if total is None else total + tensor
+            return total
+        return None
+
     if loss_output is None:
         return None
     if isinstance(loss_output, torch.Tensor):
@@ -77,11 +100,29 @@ def _extract_loss_tensor(loss_output: Any, task: str) -> Optional[torch.Tensor]:
         loss = loss_output.get('loss')
         if isinstance(loss, torch.Tensor):
             return loss
+        for key in ('weighted_loss', 'total_loss', 'final_loss', 'origin_loss'):
+            tensor = _sum_tensors(loss_output.get(key))
+            if tensor is not None:
+                return tensor
         raise TypeError(f'Loss mapping for task "{task}" must contain a tensor field named "loss".')
     loss = getattr(loss_output, 'loss', None)
     if isinstance(loss, torch.Tensor):
         return loss
+    for attr_name in ('weighted_loss', 'total_loss', 'final_loss', 'origin_loss'):
+        tensor = _sum_tensors(getattr(loss_output, attr_name, None))
+        if tensor is not None:
+            return tensor
     raise TypeError(f'Unsupported auxiliary loss output type for task "{task}": {type(loss_output)!r}.')
+
+
+def _pop_label_path_inputs(kwargs: Dict[str, object], preferred_key: str) -> Dict[str, object]:
+    label_inputs = {}
+    candidate_keys = [preferred_key, 'aux_label_path', 'labels_path', 'label_path', 'src_label_path', 'labels_file']
+    for key in candidate_keys:
+        if key in kwargs:
+            label_inputs[preferred_key] = kwargs.pop(key)
+            break
+    return label_inputs
 
 
 def _attach_task_modules(target_model: nn.Module, aux_config: Dict[str, object]) -> None:
@@ -104,10 +145,8 @@ def attach_auxiliary_modules(model: nn.Module, aux_config: Optional[Dict[str, ob
     def forward(self, *args, y_bev=None, y_cog=None, y_god=None, **kwargs):
         active_tasks = _get_active_tasks(self.aux_head_config)
         extra_task_targets = {}
-        extra_label_inputs = {}
         path_key = self.aux_head_config['shared'].get('label_loader', {}).get('path_key', 'labels_path')
-        if path_key in kwargs:
-            extra_label_inputs[path_key] = kwargs.pop(path_key)
+        extra_label_inputs = _pop_label_path_inputs(kwargs, path_key)
         for task in active_tasks:
             label_key = self.aux_head_config['tasks'][task]['label_key']
             if label_key not in {'y_bev', 'y_cog', 'y_god'} and label_key in kwargs:

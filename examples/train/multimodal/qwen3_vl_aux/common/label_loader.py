@@ -323,6 +323,18 @@ class Qwen3VLAuxLabelLoader:
                 batched_targets[task] = _move_to_device(_collate_nested(task_values), device)
             else:
                 batched_targets[task] = batched_task_views.get(task)
+        shared_label_required_tasks = {'bev', 'god'}
+        active_shared_label_tasks = [
+            task for task, task_cfg in self.cfg['tasks'].items()
+            if task_cfg.get('enabled', True) and task in shared_label_required_tasks
+        ]
+        if active_shared_label_tasks and batched_shared_labels is None:
+            available_keys = sorted(batch_kwargs.keys())
+            raise ValueError(
+                f'Failed to resolve shared auxiliary labels for tasks {active_shared_label_tasks}. '
+                f'Expected path field "{self.path_key}" in model.forward kwargs. '
+                f'Available extra label keys: {available_keys}'
+            )
         return {
             'path_key': self.path_key,
             'shared_labels': shared_labels,
