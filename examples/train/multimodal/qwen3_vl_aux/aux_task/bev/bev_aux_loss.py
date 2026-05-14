@@ -40,7 +40,37 @@ class BevAuxLoss(nn.Module):
         if self.bev_distill:
             self.loss_distill = nn.MSELoss(reduction='none')
 
+    def _normalize_gt_layout(self, gt):
+        if gt is None:
+            raise ValueError('centerpoint_head_obj_white is missing from auxiliary labels.')
+        if not isinstance(gt, (list, tuple)):
+            raise TypeError(
+                f'centerpoint_head_obj_white must be a list/tuple, got {type(gt)!r}.')
+        if not gt:
+            raise ValueError('centerpoint_head_obj_white is empty.')
+
+        # Some upstream collation paths hand us a field-major layout:
+        #   [[heatmaps_b0, ...], [anno_boxes_b0, ...], ...]
+        # while the original loss expects a sample-major layout:
+        #   [[heatmaps, anno_boxes, ...], [heatmaps, anno_boxes, ...], ...]
+        # Detect the common field-major form (outer length 8) and transpose it back.
+        if len(gt) == 8 and all(isinstance(item, (list, tuple)) for item in gt):
+            gt = [list(sample) for sample in zip(*gt)]
+
+        normalized = [list(sample) if isinstance(sample, tuple) else sample for sample in gt]
+        if not normalized:
+            raise ValueError('centerpoint_head_obj_white is empty after normalization.')
+        first = normalized[0]
+        if not isinstance(first, (list, tuple)) or len(first) < 8:
+            raise ValueError(
+                'centerpoint_head_obj_white has an unexpected layout after normalization: '
+                f'expected sample entries with at least 8 fields, got {type(first)!r} '
+                f'with length {len(first) if isinstance(first, (list, tuple)) else "n/a"}')
+        return normalized
+
     def get_target(self, gt):
+        gt = self._normalize_gt_layout(gt)
+
         def make_concats(yyy):
             yyy = list(map(list, zip(*yyy)))
             return [torch.stack(xxx) for xxx in yyy]
