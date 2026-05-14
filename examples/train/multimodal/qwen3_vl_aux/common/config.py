@@ -46,6 +46,9 @@ def build_aux_config(target_model) -> Dict[str, Any]:
     default_bev_area = [[-45.4, 95.4], [-44.8, 44.8]]
     default_common_god_area = [[-19.8, 95.4], [-22.4, 22.4]]
     default_common_cog_area = [[-16.0, 95.4], [-22.4, 22.4]]
+    default_god_resolution = 0.8
+    default_foundation_resolution = 3.2
+    default_patch_size = int(default_foundation_resolution // default_god_resolution)
     base_config: Dict[str, Any] = {
         'shared': {
             'hidden_size': hidden_size,
@@ -54,8 +57,8 @@ def build_aux_config(target_model) -> Dict[str, Any]:
             'lm_loss_weight': float(os.environ.get('QWEN3VL_AUX_LM_WEIGHT', '1.0')),
             'enabled_tasks': list(enabled_tasks_env) if enabled_tasks_env else list(AUX_TASKS),
             'bev_area': default_bev_area,
-            'god_resolution': 0.8,
-            'foundation_resolution': 3.2,
+            'god_resolution': default_god_resolution,
+            'foundation_resolution': default_foundation_resolution,
             'common_cog_area': default_common_cog_area,
             'stage_dims': [128, 256, 512, hidden_size],
             'label_loader': {
@@ -66,7 +69,7 @@ def build_aux_config(target_model) -> Dict[str, Any]:
             },
             'upsampler_cfg': {
                 'type': os.environ.get('QWEN3VL_AUX_UPSAMPLER_TYPE', 'vggt_upsampler'),
-                'patch_size': int(os.environ.get('QWEN3VL_AUX_DPT_PATCH_SIZE', '32')),
+                'patch_size': int(os.environ.get('QWEN3VL_AUX_DPT_PATCH_SIZE', str(default_patch_size))),
                 'features': int(os.environ.get('QWEN3VL_AUX_DPT_FEATURES', '256')),
                 'out_channels': _parse_int_list(
                     os.environ.get('QWEN3VL_AUX_DPT_OUT_CHANNELS', f'128,256,512,{hidden_size}')),

@@ -17,8 +17,13 @@
     },
     "upsampler_cfg": {
       "type": "vggt_upsampler",
+      "patch_size": 4,
+      "dim_in": 2048,
       "features": 128,
-      "out_channels": [128, 256, 512, 2048]
+      "out_channels": [128, 256, 512, 2048],
+      "intermediate_layer_idx": [6, 13, 20, 27],
+      "feature_only": true,
+      "pos_embed": false
     }
   },
   "tasks": {
