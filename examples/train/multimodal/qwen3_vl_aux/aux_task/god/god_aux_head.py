@@ -1,10 +1,7 @@
-
-import torch
 import torch.nn as nn
 from infrastructure import BaseModule
-from ...common.common_module import ConvClassifier, LiteClsHead, ConvDownsample, crop_bev_area_a2b
+from common.common_module import ConvClassifier, LiteClsHead, crop_bev_area_a2b
 # from lib.visualizer.train_watcher.feature_train_watcher import FeatureWatcher
-from loguru import logger
 
 
 class GodAuxHead(BaseModule):

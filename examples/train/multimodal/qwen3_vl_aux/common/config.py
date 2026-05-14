@@ -43,6 +43,9 @@ def build_aux_config(target_model) -> Dict[str, Any]:
     text_config = getattr(target_model.config, 'text_config', target_model.config)
     hidden_size = getattr(text_config, 'hidden_size', None) or getattr(target_model.config, 'hidden_size')
     enabled_tasks_env = set(_parse_task_list(os.environ.get('QWEN3VL_AUX_ENABLED_TASKS', '')))
+    default_bev_area = [[-45.4, 95.4], [-44.8, 44.8]]
+    default_common_god_area = [[-19.8, 95.4], [-22.4, 22.4]]
+    default_common_cog_area = [[-16.0, 95.4], [-22.4, 22.4]]
     base_config: Dict[str, Any] = {
         'shared': {
             'hidden_size': hidden_size,
@@ -50,6 +53,11 @@ def build_aux_config(target_model) -> Dict[str, Any]:
             'merge_size': int(os.environ.get('QWEN3VL_AUX_MERGE_SIZE', os.environ.get('SPATIAL_MERGE_SIZE', '2'))),
             'lm_loss_weight': float(os.environ.get('QWEN3VL_AUX_LM_WEIGHT', '1.0')),
             'enabled_tasks': list(enabled_tasks_env) if enabled_tasks_env else list(AUX_TASKS),
+            'bev_area': default_bev_area,
+            'god_resolution': 0.8,
+            'foundation_resolution': 3.2,
+            'common_cog_area': default_common_cog_area,
+            'stage_dims': [128, 256, 512, hidden_size],
             'label_loader': {
                 'path_key': os.environ.get('QWEN3VL_AUX_LABEL_PATH_KEY', 'labels_path'),
                 'format': os.environ.get('QWEN3VL_AUX_LABEL_FORMAT', 'mspack'),
@@ -57,9 +65,11 @@ def build_aux_config(target_model) -> Dict[str, Any]:
                 'cache_size': int(os.environ.get('QWEN3VL_AUX_LABEL_CACHE_SIZE', '256')),
             },
             'upsampler_cfg': {
+                'type': os.environ.get('QWEN3VL_AUX_UPSAMPLER_TYPE', 'vggt_upsampler'),
                 'patch_size': int(os.environ.get('QWEN3VL_AUX_DPT_PATCH_SIZE', '32')),
                 'features': int(os.environ.get('QWEN3VL_AUX_DPT_FEATURES', '256')),
-                'out_channels': _parse_int_list(os.environ.get('QWEN3VL_AUX_DPT_OUT_CHANNELS', '256,512,1024,1024')),
+                'out_channels': _parse_int_list(
+                    os.environ.get('QWEN3VL_AUX_DPT_OUT_CHANNELS', f'128,256,512,{hidden_size}')),
             },
         },
         'tasks': {},
@@ -78,6 +88,105 @@ def build_aux_config(target_model) -> Dict[str, Any]:
                 'task_name': task,
             },
         }
+
+    base_config['tasks']['god']['head'].update({
+        'in_channels': 128,
+        'out_channels': 128,
+        'conv_layer_num': 4,
+        'god_bev_area': default_bev_area,
+        'common_bev_area': default_common_god_area,
+        'god_resolution': 0.8,
+        'god_distill': True,
+        'head_key': ['occupancy', 'semantic', 'visibility', 'drivable'],
+        'head_cls_num': {
+            'occupancy': 16,
+            'semantic': 112,
+            'visibility': 16,
+            'drivable': 1,
+        },
+        'head_sigmoid': {
+            'occupancy': True,
+            'semantic': False,
+            'visibility': True,
+            'drivable': True,
+        },
+    })
+    base_config['tasks']['god']['loss'].update({
+        'hist_seq_len': 0,
+        'semantic_class': 7,
+        'decouple_sem': True,
+        'loss_tasks': ['occupancy', 'semantic', 'visibility', 'drivable'],
+        'occupancy_weights': [4.0, 4.0, 4.0, 3.0, 2.5, 1.0, 4.0],
+        'semantic_weights': [1.3, 3.0, 2.0, 1.0, 2.8, 0.05, 3.0],
+        'visibility_weights': [2.0, 1.0],
+        'drivable_weights': [1.0, 2.0],
+        'loss_weight': 5.0,
+        'god_distill': True,
+    })
+
+    base_config['tasks']['bev']['head'].update({
+        'in_channels': 128,
+        'out_channels': 64,
+        'conv_layer_num': 2,
+        'head_key': ['heatmap', 'reg', 'height', 'dim', 'rot', 'vel', 'movement'],
+        'common_heads': ['reg', 'height', 'dim', 'rot', 'vel', 'movement'],
+        'head_cls_num': {
+            'heatmap': 4,
+            'reg': 2,
+            'height': 1,
+            'dim': 3,
+            'rot': 2,
+            'vel': 2,
+            'movement': 1,
+        },
+        'tasks': [{'class_names': ['vehicle', 'pedestrian', 'cyclist', 'other']}],
+        'bev_distill': True,
+        'bbox_coder': {
+            'pc_range': [-45.4, -44.8, -5.0],
+            'post_center_range': [-45.4, -44.8, -5.0, 95.4, 44.8, 5.0],
+            'max_num': 500,
+            'score_threshold': 0.25,
+            'out_size_factor': 1,
+            'voxel_size': [0.4, 0.4, 0.5],
+            'code_size': 9,
+        },
+        'norm_bbox': True,
+    })
+    base_config['tasks']['bev']['loss'].update({
+        'hist_seq_len': 0,
+        'loss_weight': 1.0,
+        'bbox_weight': [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 3.0, 3.0, 0.3, 0.3],
+        'bev_distill': True,
+        'cls_cfg': {
+            'reduction': 'mean',
+        },
+        'bbox_cfg': {
+            'reduction': 'mean',
+            'loss_weight': 0.25,
+        },
+        'bbox_coder': {
+            'pc_range': [-45.4, -44.8, -5.0],
+            'post_center_range': [-45.4, -44.8, -5.0, 95.4, 44.8, 5.0],
+            'max_num': 500,
+            'out_size_factor': 1,
+            'voxel_size': [0.4, 0.4, 0.5],
+            'code_size': 9,
+        },
+        'post_processing': {
+            'activate': True,
+            'dedup_head': True,
+            '_lidar_setup': '3lidar',
+            'score_thresh': 0.1,
+            'nms_type': 'nms_2d_npu',
+            'nms_thresh': 0.1,
+            'nms_head_thrs': 0.4,
+            'nms_pre_maxsize': 4096,
+            'nms_post_maxsize': 100,
+            'nms_on_sight': [0.0, 0.0, 0.45, 0.45, 0.0, 0.0],
+            'thrs_vision_area': [0.25, 0.20, 0.27, 0.23, 0.25, 0.2],
+            'thrs_lidar_area': [0.25, 0.20, 0.27, 0.23, 0.25, 0.2],
+        },
+    })
 
     user_config = _load_user_config()
     merged = _deep_update(copy.deepcopy(base_config), user_config)

@@ -65,7 +65,9 @@ class AuxSeparateHeads(nn.Module):
         self.scale = int(self.foundation_resolution // self.resolution)
 
         upsampler_cfg = _get_nested(cfg, 'shared', 'upsampler_cfg', default={}) or {}
-        self.stage_dims = list(upsampler_cfg.get('out_channels', cfg.get('stage_dims', [128, 256, 512, 1024])))
+        self.stage_dims = list(
+            _get_nested(cfg, 'shared', 'stage_dims',
+                        default=upsampler_cfg.get('out_channels', cfg.get('stage_dims', [128, 256, 512, 1024]))))
         self.up_sample_type = upsampler_cfg.get('type', cfg.get('up_sample_type', 'updeconv'))
 
         # Kept for parity with the original implementation. Re-enable if the
