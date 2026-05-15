@@ -10,6 +10,20 @@ from .centerpoint_bbox_coders import CenterPointBBoxCoder
 # from lib.utils.error_monitor.monitor import train_abnormal_counter as counter
 from uvp_module.models.utils.det_utils import PostProrcessor
 
+
+def _attach_loss_items(final_loss, loss_items, weighted_loss_items):
+    payload = {
+        'loss_items': loss_items,
+        'weighted_loss_items': weighted_loss_items,
+    }
+    for key, value in payload.items():
+        try:
+            final_loss[key] = value
+        except Exception:
+            setattr(final_loss, key, value)
+    return final_loss
+
+
 def clip_sigmoid(x: torch.Tensor, eps: float = 1e-4) -> torch.Tensor:
     return torch.clamp(x.sigmoid(), min=eps, max=1 - eps)
 
@@ -236,21 +250,25 @@ class BevAuxLoss(nn.Module):
         origin_loss = []
         loss_weight = []
         weighted_loss = []
+        weighted_loss_dict = {}
 
         for k, v in loss_dict.items():
             weight = self.loss_weight
             if k == 'distill_loss':
                 weight = self.loss_weight / 3
+            weighted_item = v * weight
  
             origin_loss.append(v)
             loss_weight.append(weight)
-            weighted_loss.append(v*weight)
+            weighted_loss.append(weighted_item)
+            weighted_loss_dict[k] = weighted_item
 
         final_loss = loss_formatter(
             weighted_loss=weighted_loss,
             origin_loss=origin_loss,
             loss_weight=loss_weight,
         )
+        final_loss = _attach_loss_items(final_loss, loss_dict, weighted_loss_dict)
 
         # try:
         #     BEVWatcher.watch(labels[0]['obj_label_white'], pred_dicts, self.bbox_decoder, self.post_process)

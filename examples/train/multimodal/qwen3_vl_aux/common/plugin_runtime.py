@@ -78,6 +78,7 @@ def make_aux_state(*,
                    task_losses: Optional[Dict[str, torch.Tensor]] = None,
                    aux_total: Optional[torch.Tensor] = None,
                    weighted_aux_loss: Optional[torch.Tensor] = None,
+                   loss_items: Optional[Dict[str, Dict[str, torch.Tensor]]] = None,
                    task_weights: Optional[Dict[str, float]] = None,
                    active_tasks: Optional[Sequence[str]] = None,
                    plugin_config: Optional[Dict[str, object]] = None) -> Dict[str, Any]:
@@ -85,6 +86,7 @@ def make_aux_state(*,
         'task_losses': dict(task_losses or {}),
         'aux_total': aux_total,
         'weighted_aux_loss': weighted_aux_loss,
+        'loss_items': {task: dict(items) for task, items in (loss_items or {}).items()},
         'task_weights': dict(task_weights or {}),
         'active_tasks': list(active_tasks or []),
         'plugin_config': plugin_config,
@@ -113,6 +115,7 @@ def get_aux_state(outputs: Any = None,
                 task_losses=_LAST_AUX_STATE.get('task_losses'),
                 aux_total=_LAST_AUX_STATE.get('aux_total'),
                 weighted_aux_loss=_LAST_AUX_STATE.get('weighted_aux_loss'),
+                loss_items=_LAST_AUX_STATE.get('loss_items'),
                 task_weights=_LAST_AUX_STATE.get('task_weights'),
                 active_tasks=_LAST_AUX_STATE.get('active_tasks'),
                 plugin_config=_LAST_AUX_STATE.get('plugin_config'),
@@ -131,6 +134,7 @@ def _state_from_obj(obj: Any, default_tasks: Sequence[str]) -> Dict[str, Any]:
             task_losses=state.get('task_losses'),
             aux_total=state.get('aux_total'),
             weighted_aux_loss=state.get('weighted_aux_loss'),
+            loss_items=state.get('loss_items'),
             task_weights=state.get('task_weights'),
             active_tasks=state.get('active_tasks'),
             plugin_config=state.get('plugin_config'),
@@ -165,6 +169,9 @@ def _merge_aux_states(states: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
             merged['aux_total'] = state['aux_total']
         if state.get('weighted_aux_loss') is not None:
             merged['weighted_aux_loss'] = state['weighted_aux_loss']
+        if state.get('loss_items'):
+            for task, items in state['loss_items'].items():
+                merged['loss_items'].setdefault(task, {}).update(items)
         if state.get('active_tasks'):
             merged['active_tasks'] = list(state['active_tasks'])
         if state.get('plugin_config') is not None:

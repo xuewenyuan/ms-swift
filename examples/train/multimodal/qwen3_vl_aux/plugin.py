@@ -1,6 +1,7 @@
 import json
 import os
 import sys
+from numbers import Number
 from types import MethodType
 from typing import TYPE_CHECKING, Any, Dict, Mapping, Optional, Sequence
 
@@ -101,6 +102,48 @@ def _extract_loss_tensor(loss_output: Any, task: str) -> Optional[torch.Tensor]:
         if tensor is not None:
             return tensor
     raise TypeError(f'Unsupported auxiliary loss output type for task "{task}": {type(loss_output)!r}.')
+
+
+def _sanitize_metric_name(name: str) -> str:
+    return ''.join(ch if ch.isalnum() or ch == '_' else '_' for ch in name).strip('_')
+
+
+def _to_metric_value(value: Any):
+    if isinstance(value, torch.Tensor):
+        value = value.detach()
+        return value.mean() if value.ndim > 0 else value
+    if isinstance(value, Number):
+        return value
+    return None
+
+
+def _iter_named_values(value: Any, prefix: str = ''):
+    if isinstance(value, Mapping):
+        for key, nested in value.items():
+            key = _sanitize_metric_name(str(key))
+            name = f'{prefix}_{key}' if prefix else key
+            yield from _iter_named_values(nested, name)
+        return
+    if isinstance(value, (list, tuple)):
+        for idx, nested in enumerate(value):
+            name = f'{prefix}_{idx}' if prefix else str(idx)
+            yield from _iter_named_values(nested, name)
+        return
+    if prefix:
+        yield prefix, value
+
+
+def _extract_loss_item_metrics(loss_output: Any) -> Dict[str, Any]:
+    metrics = {}
+    for field_name, suffix in (('loss_items', ''), ('weighted_loss_items', '_weighted')):
+        loss_items = get_value(loss_output, field_name, None)
+        if loss_items is None:
+            continue
+        for name, value in _iter_named_values(loss_items):
+            metric_value = _to_metric_value(value)
+            if metric_value is not None:
+                metrics[f'{name}{suffix}'] = metric_value
+    return metrics
 
 
 def _pop_label_path_inputs(kwargs: Dict[str, object], preferred_key: str) -> Dict[str, object]:
@@ -229,6 +272,9 @@ def attach_auxiliary_modules(model: nn.Module, aux_config: Optional[Dict[str, ob
                 raise NotImplementedError(
                     f'The auxiliary loss for task "{task}" is still an interface stub. '
                     f'Please implement {task.title()}AuxLoss.forward(...).') from exc
+            loss_item_metrics = _extract_loss_item_metrics(loss_output)
+            if loss_item_metrics:
+                aux_state['loss_items'][task] = loss_item_metrics
             task_loss = _extract_loss_tensor(loss_output, task)
             aux_state['task_losses'][task] = task_loss
             set_value(outputs, f'{task}_aux_loss', task_loss)
@@ -273,10 +319,14 @@ def qwen3vl_aux_loss(outputs, labels, num_items_in_batch=None, trainer=None, **k
     weighted_aux_loss = get_value(outputs, 'loss', None)
     if weighted_aux_loss is None:
         weighted_aux_loss = aux_state.get('weighted_aux_loss')
+    loss_items = dict(aux_state.get('loss_items') or {})
     mode = None
     if trainer is not None:
         mode = 'train' if trainer.model.training else 'eval'
         trainer.custom_metrics[mode]['lm_loss'].update(lm_loss.detach())
+        for task, item_metrics in loss_items.items():
+            for name, metric_value in item_metrics.items():
+                trainer.custom_metrics[mode][f'{task}_{name}'].update(metric_value)
     aux_total = None
     for task, task_loss in task_losses.items():
         if task_loss is None:

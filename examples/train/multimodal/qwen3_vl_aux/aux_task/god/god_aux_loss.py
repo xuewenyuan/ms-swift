@@ -11,7 +11,21 @@ from ..losses.loss_utils import MultiFocalLoss, MaskedBCEWithLogitsLoss
 from infrastructure import loss_formatter
 # from lib.visualizer.train_watcher.god_head_watcher import GodHeadWatcher
 # from lib.utils.error_monitor.monitor import train_abnormal_counter as counter
-    
+
+
+def _attach_loss_items(final_loss, loss_items, weighted_loss_items):
+    payload = {
+        'loss_items': loss_items,
+        'weighted_loss_items': weighted_loss_items,
+    }
+    for key, value in payload.items():
+        try:
+            final_loss[key] = value
+        except Exception:
+            setattr(final_loss, key, value)
+    return final_loss
+
+
 class GodAuxLoss(nn.Module):
 
     def __init__(self, config, **kwargs):
@@ -149,21 +163,25 @@ class GodAuxLoss(nn.Module):
         origin_loss = []
         loss_weight = []
         weighted_loss = []
+        weighted_loss_dict = {}
 
         for k, v in loss_dict.items():
             weight = self.loss_weight
             if k == 'god_distill':
                 weight = self.loss_weight / 3
+            weighted_item = v * weight
 
             origin_loss.append(v)
             loss_weight.append(weight)
-            weighted_loss.append(v*weight)
+            weighted_loss.append(weighted_item)
+            weighted_loss_dict[k] = weighted_item
 
         final_loss = loss_formatter(
             weighted_loss=weighted_loss,
             origin_loss=origin_loss,
             loss_weight=loss_weight,
         )
+        final_loss = _attach_loss_items(final_loss, loss_dict, weighted_loss_dict)
 
         # try: 
         #     GodHeadWatcher.watch(pred_dict, gt_dict)
