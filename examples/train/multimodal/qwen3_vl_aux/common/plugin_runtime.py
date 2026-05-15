@@ -54,6 +54,22 @@ def set_value(obj: Any, key: str, value: Any) -> None:
         setattr(obj, key, value)
     except Exception:
         pass
+    if not _should_set_mapping_key(key):
+        return
+    try:
+        obj[key] = value
+    except Exception:
+        pass
+
+
+def _should_set_mapping_key(key: str) -> bool:
+    return key in {
+        'aux_enabled_tasks',
+        'aux_loss',
+        'aux_loss_weights',
+        'aux_plugin_config',
+        'aux_task_losses',
+    } or key.endswith('_aux_loss')
 
 
 def collect_task_losses_from_outputs(outputs: Any, default_tasks: Sequence[str]) -> Dict[str, torch.Tensor]:

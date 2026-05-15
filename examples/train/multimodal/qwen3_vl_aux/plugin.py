@@ -231,6 +231,7 @@ def attach_auxiliary_modules(model: nn.Module, aux_config: Optional[Dict[str, ob
                     f'Please implement {task.title()}AuxLoss.forward(...).') from exc
             task_loss = _extract_loss_tensor(loss_output, task)
             aux_state['task_losses'][task] = task_loss
+            set_value(outputs, 'aux_task_losses', aux_state['task_losses'])
             set_value(outputs, f'{task}_aux_loss', task_loss)
             set_aux_state(self, aux_state)
 
