@@ -119,7 +119,7 @@
         "in_channels": 128,
         "out_channels": 128,
         "conv_layer_num": 4,
-        "god_bev_area": [[-45.4, 95.4], [-44.8, 44.8]],
+        "god_bev_area": [[-19.8, 95.4], [-22.4, 22.4]],
         "common_bev_area": [[-19.8, 95.4], [-22.4, 22.4]],
         "god_resolution": 0.8,
         "god_distill": true,

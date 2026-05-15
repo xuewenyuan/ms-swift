@@ -96,7 +96,7 @@ def build_aux_config(target_model) -> Dict[str, Any]:
         'in_channels': 128,
         'out_channels': 128,
         'conv_layer_num': 4,
-        'god_bev_area': default_bev_area,
+        'god_bev_area': default_common_god_area,
         'common_bev_area': default_common_god_area,
         'god_resolution': 0.8,
         'god_distill': True,

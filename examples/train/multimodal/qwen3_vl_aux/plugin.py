@@ -115,6 +115,18 @@ def _extract_loss_tensor(loss_output: Any, task: str) -> Optional[torch.Tensor]:
     raise TypeError(f'Unsupported auxiliary loss output type for task "{task}": {type(loss_output)!r}.')
 
 
+def _collect_task_losses_from_outputs(outputs: Any) -> Dict[str, torch.Tensor]:
+    task_losses = dict(getattr(outputs, 'aux_task_losses', None) or {})
+    active_tasks = getattr(outputs, 'aux_enabled_tasks', None) or AUX_TASKS
+    for task in active_tasks:
+        if task in task_losses and task_losses[task] is not None:
+            continue
+        attr_loss = getattr(outputs, f'{task}_aux_loss', None)
+        if isinstance(attr_loss, torch.Tensor):
+            task_losses[task] = attr_loss
+    return {task: loss for task, loss in task_losses.items() if isinstance(loss, torch.Tensor)}
+
+
 def _pop_label_path_inputs(kwargs: Dict[str, object], preferred_key: str) -> Dict[str, object]:
     label_inputs = {}
     candidate_keys = [preferred_key, 'aux_label_path', 'labels_path', 'label_path', 'src_label_path', 'labels_file']
@@ -258,18 +270,24 @@ def qwen3vl_aux_loss(outputs, labels, num_items_in_batch=None, trainer=None, **k
     if aux_cfg is not None:
         lm_loss_weight = float(aux_cfg['shared'].get('lm_loss_weight', 1.0))
     loss = lm_loss_weight * lm_loss
-    task_losses = getattr(outputs, 'aux_task_losses', None) or {}
+    task_losses = _collect_task_losses_from_outputs(outputs)
     task_weights = getattr(outputs, 'aux_loss_weights', None) or {}
     mode = None
     if trainer is not None:
         mode = 'train' if trainer.model.training else 'eval'
         trainer.custom_metrics[mode]['lm_loss'].update(lm_loss.detach())
+    aux_total = None
     for task, task_loss in task_losses.items():
         if task_loss is None:
             continue
         if trainer is not None:
             trainer.custom_metrics[mode][f'{task}_aux_loss'].update(task_loss.detach())
+        aux_total = task_loss if aux_total is None else aux_total + task_loss
         loss = loss + float(task_weights.get(task, 1.0)) * task_loss
+    if aux_total is None:
+        aux_total = getattr(outputs, 'aux_loss', None)
+    if trainer is not None and isinstance(aux_total, torch.Tensor):
+        trainer.custom_metrics[mode]['aux_loss'].update(aux_total.detach())
     return loss
 
 
