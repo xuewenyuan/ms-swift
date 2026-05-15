@@ -32,6 +32,7 @@ if TYPE_CHECKING:
 AUX_HEAD_CONFIG = 'aux_head_config.json'
 AUX_TRAINABLES = 'aux_trainables.safetensors'
 AUX_MODULE_KEYWORDS = ('aux_heads', 'aux_losses')
+_LAST_AUX_STATE: Dict[str, Any] = {}
 
 
 def _is_true(env_key: str, default: str = 'false') -> bool:
@@ -127,6 +128,19 @@ def _collect_task_losses_from_outputs(outputs: Any) -> Dict[str, torch.Tensor]:
     return {task: loss for task, loss in task_losses.items() if isinstance(loss, torch.Tensor)}
 
 
+def _cache_last_aux_state(*, task_losses: Optional[Dict[str, torch.Tensor]] = None,
+                          aux_total: Optional[torch.Tensor] = None,
+                          task_weights: Optional[Dict[str, float]] = None,
+                          active_tasks: Optional[Sequence[str]] = None) -> None:
+    _LAST_AUX_STATE.clear()
+    _LAST_AUX_STATE.update({
+        'task_losses': dict(task_losses or {}),
+        'aux_total': aux_total,
+        'task_weights': dict(task_weights or {}),
+        'active_tasks': list(active_tasks or []),
+    })
+
+
 def _pop_label_path_inputs(kwargs: Dict[str, object], preferred_key: str) -> Dict[str, object]:
     label_inputs = {}
     candidate_keys = [preferred_key, 'aux_label_path', 'labels_path', 'label_path', 'src_label_path', 'labels_file']
@@ -178,6 +192,7 @@ def attach_auxiliary_modules(model: nn.Module, aux_config: Optional[Dict[str, ob
         self._qwen3vl_last_aux_total_loss = None
         self._qwen3vl_last_aux_loss_weights = {}
         self._qwen3vl_last_aux_enabled_tasks = list(active_tasks)
+        _cache_last_aux_state(active_tasks=active_tasks)
 
         if input_ids is None:
             return outputs
@@ -196,6 +211,7 @@ def attach_auxiliary_modules(model: nn.Module, aux_config: Optional[Dict[str, ob
             task: self.aux_head_config['tasks'][task]['loss_weight'] for task in active_tasks
         }
         self._qwen3vl_last_aux_loss_weights = dict(outputs.aux_loss_weights)
+        _cache_last_aux_state(task_weights=outputs.aux_loss_weights, active_tasks=active_tasks)
         raw_targets = {'bev': y_bev, 'cog': y_cog, 'god': y_god}
         raw_targets.update(extra_task_targets)
         aux_labels = self.aux_label_loader(
@@ -254,6 +270,12 @@ def attach_auxiliary_modules(model: nn.Module, aux_config: Optional[Dict[str, ob
             outputs.aux_task_losses[task] = task_loss
             setattr(outputs, f'{task}_aux_loss', task_loss)
             self._qwen3vl_last_aux_task_losses[task] = task_loss
+            _cache_last_aux_state(
+                task_losses=outputs.aux_task_losses,
+                aux_total=outputs.aux_loss,
+                task_weights=outputs.aux_loss_weights,
+                active_tasks=active_tasks,
+            )
 
         loss_values = [loss for loss in outputs.aux_task_losses.values() if loss is not None]
         if loss_values:
@@ -262,6 +284,12 @@ def attach_auxiliary_modules(model: nn.Module, aux_config: Optional[Dict[str, ob
                 total = total + extra
             outputs.aux_loss = total
             self._qwen3vl_last_aux_total_loss = total
+            _cache_last_aux_state(
+                task_losses=outputs.aux_task_losses,
+                aux_total=total,
+                task_weights=outputs.aux_loss_weights,
+                active_tasks=active_tasks,
+            )
         return outputs
 
     target_model.forward = MethodType(forward, target_model)
@@ -287,8 +315,12 @@ def qwen3vl_aux_loss(outputs, labels, num_items_in_batch=None, trainer=None, **k
         trainer.custom_metrics[mode]['lm_loss'].update(lm_loss.detach())
     if not task_losses and target_model is not None:
         task_losses = dict(getattr(target_model, '_qwen3vl_last_aux_task_losses', None) or {})
+    if not task_losses:
+        task_losses = dict(_LAST_AUX_STATE.get('task_losses') or {})
     if not task_weights and target_model is not None:
         task_weights = dict(getattr(target_model, '_qwen3vl_last_aux_loss_weights', None) or {})
+    if not task_weights:
+        task_weights = dict(_LAST_AUX_STATE.get('task_weights') or {})
     aux_total = None
     for task, task_loss in task_losses.items():
         if task_loss is None:
@@ -301,6 +333,8 @@ def qwen3vl_aux_loss(outputs, labels, num_items_in_batch=None, trainer=None, **k
         aux_total = getattr(outputs, 'aux_loss', None)
     if aux_total is None and target_model is not None:
         aux_total = getattr(target_model, '_qwen3vl_last_aux_total_loss', None)
+    if aux_total is None:
+        aux_total = _LAST_AUX_STATE.get('aux_total')
     if trainer is not None and isinstance(aux_total, torch.Tensor):
         trainer.custom_metrics[mode]['aux_loss'].update(aux_total.detach())
     return loss
