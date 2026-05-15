@@ -46,6 +46,10 @@ def get_value(obj: Any, key: str, default: Any = None) -> Any:
         return value
     if isinstance(obj, Mapping):
         return obj.get(key, default)
+    try:
+        return obj[key]
+    except Exception:
+        pass
     return default
 
 

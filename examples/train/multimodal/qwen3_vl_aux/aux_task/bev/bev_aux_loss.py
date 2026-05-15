@@ -18,9 +18,13 @@ def _attach_loss_items(final_loss, loss_items, weighted_loss_items):
     }
     for key, value in payload.items():
         try:
+            setattr(final_loss, key, value)
+        except Exception:
+            pass
+        try:
             final_loss[key] = value
         except Exception:
-            setattr(final_loss, key, value)
+            pass
     return final_loss
 
 
