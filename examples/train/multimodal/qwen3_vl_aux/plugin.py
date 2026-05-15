@@ -117,6 +117,8 @@ def _extract_loss_tensor(loss_output: Any, task: str) -> Optional[torch.Tensor]:
 
 def _collect_task_losses_from_outputs(outputs: Any) -> Dict[str, torch.Tensor]:
     task_losses = dict(getattr(outputs, 'aux_task_losses', None) or {})
+    if isinstance(outputs, Mapping):
+        task_losses.update(outputs.get('aux_task_losses', {}) or {})
     active_tasks = getattr(outputs, 'aux_enabled_tasks', None) or AUX_TASKS
     for task in active_tasks:
         if task in task_losses and task_losses[task] is not None:
@@ -124,6 +126,11 @@ def _collect_task_losses_from_outputs(outputs: Any) -> Dict[str, torch.Tensor]:
         attr_loss = getattr(outputs, f'{task}_aux_loss', None)
         if isinstance(attr_loss, torch.Tensor):
             task_losses[task] = attr_loss
+            continue
+        if isinstance(outputs, Mapping):
+            map_loss = outputs.get(f'{task}_aux_loss')
+            if isinstance(map_loss, torch.Tensor):
+                task_losses[task] = map_loss
     return {task: loss for task, loss in task_losses.items() if isinstance(loss, torch.Tensor)}
 
 
@@ -135,6 +142,17 @@ def _pop_label_path_inputs(kwargs: Dict[str, object], preferred_key: str) -> Dic
             label_inputs[preferred_key] = kwargs.pop(key)
             break
     return label_inputs
+
+
+def _mapping_set(outputs: Any, key: str, value: Any) -> None:
+    if isinstance(outputs, dict):
+        outputs[key] = value
+        return
+    if isinstance(outputs, Mapping):
+        try:
+            outputs[key] = value
+        except Exception:
+            pass
 
 
 def _attach_task_modules(target_model: nn.Module, aux_config: Dict[str, object]) -> None:
@@ -174,6 +192,10 @@ def attach_auxiliary_modules(model: nn.Module, aux_config: Optional[Dict[str, ob
         outputs.aux_predictions = {}
         outputs.aux_task_losses = {}
         outputs.aux_loss = None
+        _mapping_set(outputs, 'aux_plugin_config', self.aux_head_config)
+        _mapping_set(outputs, 'aux_predictions', outputs.aux_predictions)
+        _mapping_set(outputs, 'aux_task_losses', outputs.aux_task_losses)
+        _mapping_set(outputs, 'aux_loss', outputs.aux_loss)
 
         if input_ids is None:
             return outputs
@@ -191,6 +213,10 @@ def attach_auxiliary_modules(model: nn.Module, aux_config: Optional[Dict[str, ob
         outputs.aux_loss_weights = {
             task: self.aux_head_config['tasks'][task]['loss_weight'] for task in active_tasks
         }
+        _mapping_set(outputs, 'aux_features', outputs.aux_features)
+        _mapping_set(outputs, 'visual_hidden_state_layers', outputs.visual_hidden_state_layers)
+        _mapping_set(outputs, 'aux_enabled_tasks', outputs.aux_enabled_tasks)
+        _mapping_set(outputs, 'aux_loss_weights', outputs.aux_loss_weights)
         raw_targets = {'bev': y_bev, 'cog': y_cog, 'god': y_god}
         raw_targets.update(extra_task_targets)
         aux_labels = self.aux_label_loader(
@@ -200,6 +226,7 @@ def attach_auxiliary_modules(model: nn.Module, aux_config: Optional[Dict[str, ob
             device=hidden_states[-1].device,
         )
         outputs.aux_labels = aux_labels
+        _mapping_set(outputs, 'aux_labels', aux_labels)
 
         try:
             head_outputs = self.aux_heads(
@@ -222,6 +249,7 @@ def attach_auxiliary_modules(model: nn.Module, aux_config: Optional[Dict[str, ob
         if not isinstance(head_outputs, Mapping):
             raise TypeError(f'AuxSeparateHeads must return a mapping or a single-item list, got {type(head_outputs)!r}.')
         outputs.aux_head_outputs = head_outputs
+        _mapping_set(outputs, 'aux_head_outputs', head_outputs)
 
         for task in active_tasks:
             prediction = head_outputs.get(f'{task}_aux_head_output')
@@ -229,6 +257,7 @@ def attach_auxiliary_modules(model: nn.Module, aux_config: Optional[Dict[str, ob
                 continue
             outputs.aux_predictions[task] = prediction
             setattr(outputs, f'{task}_prediction', prediction)
+            _mapping_set(outputs, f'{task}_prediction', prediction)
 
             try:
                 loss_output = self.aux_losses(
@@ -248,6 +277,8 @@ def attach_auxiliary_modules(model: nn.Module, aux_config: Optional[Dict[str, ob
             task_loss = _extract_loss_tensor(loss_output, task)
             outputs.aux_task_losses[task] = task_loss
             setattr(outputs, f'{task}_aux_loss', task_loss)
+            _mapping_set(outputs, 'aux_task_losses', outputs.aux_task_losses)
+            _mapping_set(outputs, f'{task}_aux_loss', task_loss)
 
         loss_values = [loss for loss in outputs.aux_task_losses.values() if loss is not None]
         if loss_values:
@@ -255,6 +286,7 @@ def attach_auxiliary_modules(model: nn.Module, aux_config: Optional[Dict[str, ob
             for extra in loss_values[1:]:
                 total = total + extra
             outputs.aux_loss = total
+            _mapping_set(outputs, 'aux_loss', total)
         return outputs
 
     target_model.forward = MethodType(forward, target_model)
@@ -286,6 +318,8 @@ def qwen3vl_aux_loss(outputs, labels, num_items_in_batch=None, trainer=None, **k
         loss = loss + float(task_weights.get(task, 1.0)) * task_loss
     if aux_total is None:
         aux_total = getattr(outputs, 'aux_loss', None)
+    if aux_total is None and isinstance(outputs, Mapping):
+        aux_total = outputs.get('aux_loss')
     if trainer is not None and isinstance(aux_total, torch.Tensor):
         trainer.custom_metrics[mode]['aux_loss'].update(aux_total.detach())
     return loss
