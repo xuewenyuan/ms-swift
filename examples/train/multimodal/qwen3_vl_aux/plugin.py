@@ -231,7 +231,6 @@ def attach_auxiliary_modules(model: nn.Module, aux_config: Optional[Dict[str, ob
                     f'Please implement {task.title()}AuxLoss.forward(...).') from exc
             task_loss = _extract_loss_tensor(loss_output, task)
             aux_state['task_losses'][task] = task_loss
-            set_value(outputs, 'aux_task_losses', aux_state['task_losses'])
             set_value(outputs, f'{task}_aux_loss', task_loss)
             set_aux_state(self, aux_state)
 
@@ -241,7 +240,16 @@ def attach_auxiliary_modules(model: nn.Module, aux_config: Optional[Dict[str, ob
             for extra in loss_values[1:]:
                 total = total + extra
             aux_state['aux_total'] = total
+            weighted_total = None
+            for task, task_loss in aux_state['task_losses'].items():
+                if task_loss is None:
+                    continue
+                weighted_loss = float(task_weights.get(task, 1.0)) * task_loss
+                weighted_total = weighted_loss if weighted_total is None else weighted_total + weighted_loss
+            aux_state['weighted_aux_loss'] = weighted_total
             set_value(outputs, 'aux_loss', total)
+            if weighted_total is not None:
+                set_value(outputs, 'loss', weighted_total)
             set_aux_state(self, aux_state)
         return outputs
 
@@ -262,6 +270,9 @@ def qwen3vl_aux_loss(outputs, labels, num_items_in_batch=None, trainer=None, **k
     loss = lm_loss_weight * lm_loss
     task_losses = collect_task_losses_from_outputs(outputs, AUX_TASKS) or dict(aux_state.get('task_losses') or {})
     task_weights = get_value(outputs, 'aux_loss_weights', None) or dict(aux_state.get('task_weights') or {})
+    weighted_aux_loss = get_value(outputs, 'loss', None)
+    if weighted_aux_loss is None:
+        weighted_aux_loss = aux_state.get('weighted_aux_loss')
     mode = None
     if trainer is not None:
         mode = 'train' if trainer.model.training else 'eval'
@@ -273,7 +284,10 @@ def qwen3vl_aux_loss(outputs, labels, num_items_in_batch=None, trainer=None, **k
         if trainer is not None:
             trainer.custom_metrics[mode][f'{task}_aux_loss'].update(task_loss.detach())
         aux_total = task_loss if aux_total is None else aux_total + task_loss
-        loss = loss + float(task_weights.get(task, 1.0)) * task_loss
+        if weighted_aux_loss is None:
+            loss = loss + float(task_weights.get(task, 1.0)) * task_loss
+    if isinstance(weighted_aux_loss, torch.Tensor):
+        loss = loss + weighted_aux_loss.to(loss.device)
     if aux_total is None:
         aux_total = get_value(outputs, 'aux_loss', None)
     if aux_total is None:

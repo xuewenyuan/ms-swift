@@ -54,22 +54,12 @@ def set_value(obj: Any, key: str, value: Any) -> None:
         setattr(obj, key, value)
     except Exception:
         pass
-    if not _should_set_mapping_key(key):
+    if key != 'loss':
         return
     try:
         obj[key] = value
     except Exception:
         pass
-
-
-def _should_set_mapping_key(key: str) -> bool:
-    return key in {
-        'aux_enabled_tasks',
-        'aux_loss',
-        'aux_loss_weights',
-        'aux_plugin_config',
-        'aux_task_losses',
-    } or key.endswith('_aux_loss')
 
 
 def collect_task_losses_from_outputs(outputs: Any, default_tasks: Sequence[str]) -> Dict[str, torch.Tensor]:
@@ -87,12 +77,14 @@ def collect_task_losses_from_outputs(outputs: Any, default_tasks: Sequence[str])
 def make_aux_state(*,
                    task_losses: Optional[Dict[str, torch.Tensor]] = None,
                    aux_total: Optional[torch.Tensor] = None,
+                   weighted_aux_loss: Optional[torch.Tensor] = None,
                    task_weights: Optional[Dict[str, float]] = None,
                    active_tasks: Optional[Sequence[str]] = None,
                    plugin_config: Optional[Dict[str, object]] = None) -> Dict[str, Any]:
     return {
         'task_losses': dict(task_losses or {}),
         'aux_total': aux_total,
+        'weighted_aux_loss': weighted_aux_loss,
         'task_weights': dict(task_weights or {}),
         'active_tasks': list(active_tasks or []),
         'plugin_config': plugin_config,
@@ -120,6 +112,7 @@ def get_aux_state(outputs: Any = None,
             make_aux_state(
                 task_losses=_LAST_AUX_STATE.get('task_losses'),
                 aux_total=_LAST_AUX_STATE.get('aux_total'),
+                weighted_aux_loss=_LAST_AUX_STATE.get('weighted_aux_loss'),
                 task_weights=_LAST_AUX_STATE.get('task_weights'),
                 active_tasks=_LAST_AUX_STATE.get('active_tasks'),
                 plugin_config=_LAST_AUX_STATE.get('plugin_config'),
@@ -137,6 +130,7 @@ def _state_from_obj(obj: Any, default_tasks: Sequence[str]) -> Dict[str, Any]:
         return make_aux_state(
             task_losses=state.get('task_losses'),
             aux_total=state.get('aux_total'),
+            weighted_aux_loss=state.get('weighted_aux_loss'),
             task_weights=state.get('task_weights'),
             active_tasks=state.get('active_tasks'),
             plugin_config=state.get('plugin_config'),
@@ -150,6 +144,7 @@ def _state_from_obj(obj: Any, default_tasks: Sequence[str]) -> Dict[str, Any]:
         return make_aux_state(
             task_losses=task_losses,
             aux_total=aux_total,
+            weighted_aux_loss=get_value(obj, 'loss', None),
             task_weights=task_weights,
             active_tasks=active_tasks,
             plugin_config=plugin_config,
@@ -168,6 +163,8 @@ def _merge_aux_states(states: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
             merged['task_weights'].update(state['task_weights'])
         if state.get('aux_total') is not None:
             merged['aux_total'] = state['aux_total']
+        if state.get('weighted_aux_loss') is not None:
+            merged['weighted_aux_loss'] = state['weighted_aux_loss']
         if state.get('active_tasks'):
             merged['active_tasks'] = list(state['active_tasks'])
         if state.get('plugin_config') is not None:
