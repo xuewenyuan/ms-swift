@@ -146,13 +146,15 @@ def _state_from_obj(obj: Any, default_tasks: Sequence[str]) -> Dict[str, Any]:
     task_losses = collect_task_losses_from_outputs(obj, default_tasks)
     task_weights = get_value(obj, 'aux_loss_weights', None)
     aux_total = get_value(obj, 'aux_loss', None)
+    weighted_aux_loss = get_value(obj, 'aux_weighted_loss', None)
     active_tasks = get_value(obj, 'aux_enabled_tasks', None)
     plugin_config = get_value(obj, 'aux_plugin_config', None)
-    if task_losses or task_weights or aux_total is not None or active_tasks or plugin_config is not None:
+    if (task_losses or task_weights or aux_total is not None or weighted_aux_loss is not None or active_tasks
+            or plugin_config is not None):
         return make_aux_state(
             task_losses=task_losses,
             aux_total=aux_total,
-            weighted_aux_loss=get_value(obj, 'loss', None),
+            weighted_aux_loss=weighted_aux_loss,
             task_weights=task_weights,
             active_tasks=active_tasks,
             plugin_config=plugin_config,

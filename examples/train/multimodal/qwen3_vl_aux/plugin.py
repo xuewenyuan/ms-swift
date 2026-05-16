@@ -97,6 +97,9 @@ def _extract_loss_tensor(loss_output: Any, task: str) -> Optional[torch.Tensor]:
         loss = loss_output.get('loss')
         if isinstance(loss, torch.Tensor) and loss.numel() == 1:
             return _scalarize_loss_tensor(loss)
+        tensor = _sum_tensors(loss_output.get('weighted_loss_items'))
+        if tensor is not None:
+            return tensor
         for key in ('total_loss', 'final_loss', 'weighted_loss', 'origin_loss'):
             tensor = _sum_tensors(loss_output.get(key))
             if tensor is not None:
@@ -107,6 +110,9 @@ def _extract_loss_tensor(loss_output: Any, task: str) -> Optional[torch.Tensor]:
     loss = getattr(loss_output, 'loss', None)
     if isinstance(loss, torch.Tensor) and loss.numel() == 1:
         return _scalarize_loss_tensor(loss)
+    tensor = _sum_tensors(get_value(loss_output, 'weighted_loss_items', None))
+    if tensor is not None:
+        return tensor
     for attr_name in ('total_loss', 'final_loss', 'weighted_loss', 'origin_loss'):
         tensor = _sum_tensors(getattr(loss_output, attr_name, None))
         if tensor is not None:
@@ -156,6 +162,13 @@ def _extract_loss_item_metrics(loss_output: Any) -> Dict[str, Any]:
             if metric_value is not None:
                 metrics[f'{name}{suffix}'] = metric_value
     return metrics
+
+
+def _attach_aux_state_to_outputs(outputs: Any, aux_state: Dict[str, Any]) -> None:
+    try:
+        setattr(outputs, AUX_STATE_ATTR, aux_state)
+    except Exception:
+        pass
 
 
 def _pop_label_path_inputs(kwargs: Dict[str, object], preferred_key: str) -> Dict[str, object]:
@@ -291,6 +304,7 @@ def attach_auxiliary_modules(model: nn.Module, aux_config: Optional[Dict[str, ob
             aux_state['task_losses'][task] = task_loss
             set_value(outputs, f'{task}_aux_loss', task_loss)
             set_aux_state(self, aux_state)
+            _attach_aux_state_to_outputs(outputs, aux_state)
 
         loss_values = [loss for loss in aux_state['task_losses'].values() if loss is not None]
         if loss_values:
@@ -310,6 +324,7 @@ def attach_auxiliary_modules(model: nn.Module, aux_config: Optional[Dict[str, ob
                 set_value(outputs, 'aux_weighted_loss', weighted_total)
                 set_value(outputs, 'loss', weighted_total)
             set_aux_state(self, aux_state)
+            _attach_aux_state_to_outputs(outputs, aux_state)
         return outputs
 
     target_model.forward = MethodType(forward, target_model)
