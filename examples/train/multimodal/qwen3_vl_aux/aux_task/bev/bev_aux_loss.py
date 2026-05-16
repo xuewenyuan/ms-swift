@@ -154,27 +154,36 @@ class BevAuxLoss(nn.Module):
         gt_heatmaps, gt_boxes, inds, masks, gt_movement, movement_weight = self.get_target(gt_dict)
 
         pred_heatmap = clip_sigmoid(pred_dicts['heatmap'])
+        aux_device = pred_heatmap.device
+        aux_dtype = pred_heatmap.dtype
+        gt_heatmaps = gt_heatmaps.to(device=aux_device, dtype=aux_dtype)
+        gt_boxes = gt_boxes.to(device=aux_device, dtype=aux_dtype)
+        inds = inds.to(device=aux_device)
+        masks = masks.to(device=aux_device)
+        gt_movement = gt_movement.to(device=aux_device, dtype=aux_dtype)
+        movement_weight = movement_weight.to(device=aux_device, dtype=aux_dtype)
 
         sample_mask = labels[0].get('rl_sample_mask', None)
         if sample_mask is not None:
+            sample_mask = sample_mask.to(device=aux_device, dtype=aux_dtype)
             gt_heatmaps = gt_heatmaps * sample_mask[..., None, None]
         num_pos = gt_heatmaps.eq(1).float().sum().item()
 
         bs, c, h, w = pred_heatmap.shape
-        nearby_mask = torch.ones((1, 1, h, w), dtype=torch.float32).to(pred_heatmap.device)
+        nearby_mask = torch.ones((1, 1, h, w), dtype=aux_dtype, device=aux_device)
 
-        bevseg_valid = torch.ones((bs, 1), device=pred_heatmap.device).bool()
+        bevseg_valid = torch.ones((bs, 1), device=aux_device).bool()
         if 'bevseg_cache_valid' in labels[0]:
-            bevseg_valid = bevseg_valid & labels[0]['bevseg_cache_valid']
+            bevseg_valid = bevseg_valid & labels[0]['bevseg_cache_valid'].to(device=aux_device)
 
         # counter.count_error('bevseg_invalid_frames', (~bevseg_valid).sum().item())
 
-        bev_feat_valid = torch.ones((bs, 1), device=sample_mask.device).bool()
+        bev_feat_valid = torch.ones((bs, 1), device=aux_device).bool()
         if 'bev_feat_cache_valid' in labels[0]:
-            bev_feat_valid = bev_feat_valid & labels[0]['bev_feat_cache_valid']
+            bev_feat_valid = bev_feat_valid & labels[0]['bev_feat_cache_valid'].to(device=aux_device)
         # counter.count_error('bev_feat_invalid_frames', (~bev_feat_valid).sum().item())
 
-        not_cls_only = 1 - labels[0]['is_cls_only']
+        not_cls_only = 1 - labels[0]['is_cls_only'].to(device=aux_device, dtype=aux_dtype)
         cls_mask = sample_mask * bevseg_valid
         distill_mask = cls_mask * bev_feat_valid
 
@@ -192,11 +201,11 @@ class BevAuxLoss(nn.Module):
         else:
             num = (masks * not_cls_only * sample_mask).float().sum()
 
-        mask = masks.unsqueeze(2).expand_as(gt_boxes).float()
-        isnotnan = (~torch.isnan(gt_boxes)).float()
+        mask = masks.unsqueeze(2).expand_as(gt_boxes).to(dtype=aux_dtype)
+        isnotnan = (~torch.isnan(gt_boxes)).to(dtype=aux_dtype)
         mask *= isnotnan
 
-        valid_velocity = (gt_boxes[..., -2:] < INVALID_VELOCITY).float()
+        valid_velocity = (gt_boxes[..., -2:] < INVALID_VELOCITY).to(dtype=aux_dtype)
         mask[..., -2:] *= valid_velocity
 
         bbox_weights = mask * mask.new_tensor(self.bbox_weight)
@@ -208,6 +217,8 @@ class BevAuxLoss(nn.Module):
                                 pred_dicts['vel']), dim=1)
         pred_boxes = pred_boxes.permute(0, 2, 3, 1).flatten(1, 2)
         pred_boxes = self._gather_feat(pred_boxes, inds)
+        gt_boxes = gt_boxes.to(device=pred_boxes.device, dtype=pred_boxes.dtype)
+        bbox_weights = bbox_weights.to(device=pred_boxes.device, dtype=pred_boxes.dtype)
         
         if sample_mask is not None:
             reg_mask = not_cls_only * sample_mask
@@ -224,6 +235,8 @@ class BevAuxLoss(nn.Module):
 
         pred_mov = pred_dicts['movement'].permute(0, 2, 3, 1).flatten(1, 2)
         pred_mov = self._gather_feat(pred_mov, inds)
+        gt_movement = gt_movement.to(device=pred_mov.device, dtype=pred_mov.dtype)
+        movement_weight = movement_weight.to(device=pred_mov.device, dtype=pred_mov.dtype)
 
         mov_weight = mask[..., -1, None] * movement_weight * not_cls_only[..., None] * bevseg_valid[..., None]
         if sample_mask is not None:
@@ -236,6 +249,8 @@ class BevAuxLoss(nn.Module):
         if self.bev_distill:
             gt_feat = labels[0]['pnc_bev_input']['dense_bev_feat']
             pred_feat = pred_dicts['distill_feat']
+            gt_feat = gt_feat.to(device=pred_feat.device, dtype=pred_feat.dtype)
+            distill_mask = distill_mask.to(device=pred_feat.device, dtype=pred_feat.dtype)
             distill_loss = self.loss_distill(pred_feat, gt_feat)
             distill_loss = distill_loss * distill_mask[..., None, None]
  

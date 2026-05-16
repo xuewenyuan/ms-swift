@@ -102,13 +102,16 @@ class GodAuxLoss(nn.Module):
             semantic_gt = semantic_gt * (~unoccupancy_index) + unoccupancy_index * GOD_SEMANTIC_TYPE_MAPPING["UNOCCUPANCY"]
 
         if 'occupancy' in self.loss_tasks:
-            occupancy_map_gt = occupancy_map_gt.float()
-            occupancy_loss = self.loss_occupancy(pred_dict['occupancy'], occupancy_map_gt) # [2, 16, 288, 112], [2, 16, 288, 112]
+            occupancy_pred = pred_dict['occupancy']
+            occupancy_map_gt = occupancy_map_gt.to(device=occupancy_pred.device, dtype=occupancy_pred.dtype)
+            occupancy_loss = self.loss_occupancy(occupancy_pred, occupancy_map_gt) # [2, 16, 288, 112], [2, 16, 288, 112]
+            godseg_valid = godseg_valid.to(device=occupancy_pred.device)
 
             # different occ weight for different semantic
             occupancy_weights = torch.zeros_like(occupancy_map_gt)
+            semantic_occ_gt = semantic_gt.to(device=occupancy_pred.device)
             for s_class in range(self.semantic_class):
-                semantic_occ_mask = (semantic_gt == s_class)
+                semantic_occ_mask = (semantic_occ_gt == s_class)
                 occupancy_weights = occupancy_weights + semantic_occ_mask * self.occupancy_weights[s_class]
 
             occupancy_loss = occupancy_loss * godseg_valid[..., None, None]
@@ -121,25 +124,32 @@ class GodAuxLoss(nn.Module):
 
             b, z, h, w = occupancy_map_gt.shape
             semantic_pred = pred_dict['semantic'].view(b, z, self.semantic_class, h, w).permute(0, 2, 1, 3, 4)
+            semantic_gt = semantic_gt.to(device=semantic_pred.device)
+            godseg_valid = godseg_valid.to(device=semantic_pred.device)
             semantic_loss = self.loss_semantic(semantic_pred, semantic_gt)
             semantic_loss = semantic_loss * godseg_valid[..., None, None]
             loss_dict['semantic'] = torch.mean(semantic_loss)
 
         if 'visibility' in self.loss_tasks:
             visibility_gt = gt_dict['visibility']
+            visibility_pred = pred_dict['visibility']
+            visibility_gt = visibility_gt.to(device=visibility_pred.device, dtype=visibility_pred.dtype)
+            godseg_valid = godseg_valid.to(device=visibility_pred.device)
 
             visibility_class_weight = torch.ones_like(visibility_gt) * self.visibility_weights[0]
             visibility_gt_index =(visibility_gt == 1)
             visibility_class_weight = visibility_class_weight * (~visibility_gt_index) + visibility_gt_index * self.visibility_weights[1]
 
-            visibility_loss = self.loss_visibility(pred_dict['visibility'], visibility_gt.float(), weight=visibility_class_weight)
+            visibility_loss = self.loss_visibility(visibility_pred, visibility_gt, weight=visibility_class_weight)
             visibility_loss = visibility_loss * godseg_valid[..., None, None, None]
             loss_dict['visibility'] = torch.mean(visibility_loss)
 
         if 'drivable' in self.loss_tasks:
             # for drivable area
             drivable_area_gt = gt_dict['drivable']
-            drivable_area_gt = drivable_area_gt.float()
+            drivable_pred = pred_dict['drivable']
+            drivable_area_gt = drivable_area_gt.to(device=drivable_pred.device, dtype=drivable_pred.dtype)
+            godseg_valid = godseg_valid.to(device=drivable_pred.device)
             
             drivable_valid_mask = gt_dict.get('drivable_valid_mask', None)
             if drivable_valid_mask is not None:
@@ -151,15 +161,18 @@ class GodAuxLoss(nn.Module):
             drivable_curb_mask = gt_dict.get(self.drivable_curb_mask_source)
             if drivable_curb_mask is not None and self.drivable_curb_weight > 0:
                 # 只对curb区域，提升Loss权重
+                drivable_curb_mask = drivable_curb_mask.to(device=drivable_pred.device, dtype=drivable_pred.dtype)
                 drivable_weights = drivable_weights * (drivable_curb_mask[..., None] * (self.drivable_curb_weight - 1) + 1)
 
-            drivable_loss = self.loss_drivable(pred_dict['drivable'], drivable_area_gt, weight=drivable_weights)
+            drivable_loss = self.loss_drivable(drivable_pred, drivable_area_gt, weight=drivable_weights)
             drivable_loss = drivable_loss * godseg_valid[..., None, None]
             loss_dict['drivable'] = torch.mean(drivable_loss)
 
         if self.god_distill:
             gt_feat = labels[0]['pnc_god_dense_input'] # [2, 64, 144, 56]
             pred_feat = pred_dict['distill_feat']      # [2, 64, 144, 56]
+            gt_feat = gt_feat.to(device=pred_feat.device, dtype=pred_feat.dtype)
+            godfeat_valid = godfeat_valid.to(device=pred_feat.device)
             distill_loss = self.loss_distill(pred_feat, gt_feat)
             distill_loss = distill_loss * godfeat_valid[..., None, None]
             loss_dict['god_distill'] = torch.mean(distill_loss)

@@ -18,6 +18,7 @@ def gaussian_focal_loss(pred, gaussian_target, alpha=2.0, gamma=4.0, sample_mask
         gamma (float, optional): The gamma for calculating the modulating
             factor. Defaults to 4.0.
     """
+    gaussian_target = gaussian_target.to(device=pred.device, dtype=pred.dtype)
     eps = 1e-12
     pos_weights = gaussian_target.eq(1)
     neg_weights = (1 - gaussian_target).pow(gamma)
@@ -29,6 +30,7 @@ def gaussian_focal_loss(pred, gaussian_target, alpha=2.0, gamma=4.0, sample_mask
     rslt = torch.where(torch.isinf(rslt), torch.full_like(rslt, 0), rslt)
 
     if sample_mask is not None:
+        sample_mask = sample_mask.to(device=pred.device, dtype=pred.dtype)
         if len(rslt.shape) == len(sample_mask.shape):
             rslt = rslt * sample_mask
         else:
@@ -92,7 +94,7 @@ class GaussianFocalLoss(nn.Module):
             reduction_override if reduction_override else self.reduction)
         if weight:
             weight = weight / np.sum(weight)
-            weight = torch.from_numpy(np.reshape(weight, [1, 4, 1, 1])).to(pred.device)
+            weight = torch.from_numpy(np.reshape(weight, [1, 4, 1, 1])).to(device=pred.device, dtype=pred.dtype)
         loss_reg = self.loss_weight * gaussian_focal_loss(
             pred,
             target,

@@ -28,6 +28,8 @@ class WeightedCrossEntropyLoss(nn.Module):
             loss: (B, #anchors) float tensor.
                 Weighted cross entropy loss without reduction
         """
+        target = target.to(device=input.device)
+        weights = weights.to(device=input.device, dtype=input.dtype)
         input = input.permute(0, 2, 1)
         target = target.argmax(dim=-1)
         loss = F.cross_entropy(input, target, reduction='none') * weights
@@ -82,6 +84,8 @@ class SigmoidFocalClassificationLoss(nn.Module):
         Returns:
             weighted_loss: (B, #anchors, #classes) float tensor after weighting.
         """
+        target = target.to(device=input.device, dtype=input.dtype)
+        weights = weights.to(device=input.device, dtype=input.dtype)
         pred_sigmoid = torch.sigmoid(input)
         alpha_weight = target * self.alpha + (1 - target) * (1 - self.alpha)
         pt = target * (1.0 - pred_sigmoid) + (1.0 - target) * pred_sigmoid
@@ -149,17 +153,20 @@ class WeightedSmoothL1Loss(nn.Module):
             loss: (B, #anchors) float tensor.
                 Weighted smooth l1 loss without reduction.
         """
+        target = target.to(device=input.device, dtype=input.dtype)
         target = torch.where(torch.isnan(target), input, target)  # ignore nan targets
 
         diff = input - target
         # code-wise weighting
         if self.code_weights is not None:
-            diff = diff * self.code_weights.view(1, 1, -1)
+            code_weights = self.code_weights.to(device=diff.device, dtype=diff.dtype)
+            diff = diff * code_weights.view(1, 1, -1)
 
         loss = self.smooth_l1_loss(diff, self.beta)
 
         # anchor-wise weighting
         if weights is not None:
+            weights = weights.to(device=loss.device, dtype=loss.dtype)
             assert weights.shape[0] == loss.shape[0] and weights.shape[1] == loss.shape[1]
             loss = loss * weights.unsqueeze(-1)
 
@@ -171,8 +178,11 @@ class MaskedRegressionLoss(torch.nn.Module):
         self.loss_fn = torch.nn.SmoothL1Loss(reduction='none')
 
     def forward(self, regress_results, gt, mask, weights=None):
+        gt = gt.to(device=regress_results.device, dtype=regress_results.dtype)
+        mask = mask.to(device=regress_results.device, dtype=regress_results.dtype)
         loss = self.loss_fn(regress_results, gt)
         if weights is not None:
+            weights = weights.to(device=regress_results.device, dtype=regress_results.dtype)
             loss *= weights
         if len(loss.shape) == 4 and len(mask.shape) == 3:
             loss = torch.mean(loss, 1)
@@ -185,6 +195,8 @@ class MaskedMSELoss(torch.nn.Module):
         super(MaskedMSELoss, self).__init__()
 
     def forward(self, pred, gt, mask):
+        gt = gt.to(device=pred.device, dtype=pred.dtype)
+        mask = mask.to(device=pred.device, dtype=pred.dtype)
         out = torch.sum(((pred - gt) * mask)**2.0)  / (torch.sum(mask) + 1 )
         return out
 
@@ -225,7 +237,7 @@ class MultiClassFocalLoss_Ori(nn.Module):
 
         pt = logit.gather(1, target).view(-1) + self.eps
         logpt = torch.log(pt)
-        alpha = self.alpha.to(logpt.device)
+        alpha = self.alpha.to(device=logpt.device, dtype=logpt.dtype)
 
         alpha_class = alpha.gather(0, target.view(-1))
         logpt = alpha_class * logpt
@@ -257,6 +269,7 @@ class MaskedCrossEntropyLoss(nn.Module):
         self.loss = torch.nn.CrossEntropyLoss(weight=weight, reduction='none')
 
     def forward(self, outputs, labels, mask):
+        mask = mask.to(device=outputs.device, dtype=outputs.dtype)
         loss = self.loss(outputs, labels) * mask
         mask_loss = torch.sum(loss) / (torch.sum(mask) + 1)
         return mask_loss
@@ -274,7 +287,8 @@ class MaskedDiceLoss(nn.Module):
             target: (N, H, W)      # 类别标签（0 ~ num_classes-1）
             mask:   (N, H, W)      # 二值掩码（0或1，1的区域参与计算）
         """
-
+        target = target.to(device=pred.device)
+        mask = mask.to(device=pred.device, dtype=pred.dtype)
         # 计算 masked 交集和并集
         pred = F.softmax(pred, dim=1) * mask  # 掩码作用在预测结果
         target = target * mask   # 掩码作用在真实标签
@@ -294,6 +308,8 @@ class MaskedBCELoss(nn.Module):
         self.BCE_loss = nn.BCELoss(reduction="none")
 
     def forward(self, pred, labels, weight):
+        labels = labels.to(device=pred.device, dtype=pred.dtype)
+        weight = weight.to(device=pred.device, dtype=pred.dtype)
         loss = self.BCE_loss(pred, labels) * weight
         return loss
 
@@ -306,6 +322,8 @@ class MaskedBCEWithLogitsLoss(nn.Module):
         self.BCE_loss = nn.BCEWithLogitsLoss(reduction="none")
 
     def forward(self, pred, labels, weight):
+        labels = labels.to(device=pred.device, dtype=pred.dtype)
+        weight = weight.to(device=pred.device, dtype=pred.dtype)
         loss = self.BCE_loss(pred, labels) * weight
         return loss
 
@@ -356,7 +374,7 @@ class MultiFocalLoss(nn.Module):
         # alpha = alpha * (1 - self.alpha)
         # alpha = alpha.scatter_(1, target.long(), self.alpha)
         epsilon = 1e-10
-        alpha = self.alpha.to(device=input.device, dtype=input.dtype)
+        alpha = self.alpha.to(device=input.device, dtype=input.dtype).clone()
 
         idx = target.long()
         # one_hot_key = torch.FloatTensor(target.shape[0], self.num_class).zero_()
@@ -364,10 +382,8 @@ class MultiFocalLoss(nn.Module):
         one_hot_key = F.one_hot(idx.to(torch.int64), self.num_class)
         t_perm_idx = list(range(len(one_hot_key.shape)-1))
         t_perm_idx.insert(1, len(one_hot_key.shape)-1)
-        one_hot_key = one_hot_key.permute(t_perm_idx).contiguous().long()
-
-        if one_hot_key.device != logit.device:
-            one_hot_key = one_hot_key.to(logit.device)
+        one_hot_key = one_hot_key.permute(t_perm_idx).contiguous()
+        one_hot_key = one_hot_key.to(device=logit.device, dtype=logit.dtype)
 
         if self.smooth:
             one_hot_key = torch.clamp(
@@ -389,7 +405,8 @@ class MultiFocalLoss(nn.Module):
         loss = -1 * alpha * torch.pow((1 - pt), gamma) * logpt
         
         if weight is not None:
+            weight = weight.to(device=loss.device, dtype=loss.dtype)
             loss = (loss * weight)
-            loss = loss.sum() / ((weight > 0).to(torch.float32).sum() + 0.001)
+            loss = loss.sum() / ((weight > 0).to(loss.dtype).sum() + 0.001)
         
         return loss

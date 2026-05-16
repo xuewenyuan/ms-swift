@@ -57,12 +57,20 @@ def _get_active_tasks(aux_config: Dict[str, object]) -> Sequence[str]:
     return [task for task in AUX_TASKS if tasks_cfg.get(task, {}).get('enabled', True)]
 
 
+def _scalarize_loss_tensor(loss: torch.Tensor) -> torch.Tensor:
+    if loss.ndim == 0:
+        return loss
+    if loss.numel() == 1:
+        return loss.reshape(())
+    return loss.mean()
+
+
 def _extract_loss_tensor(loss_output: Any, task: str) -> Optional[torch.Tensor]:
     def _sum_tensors(value: Any) -> Optional[torch.Tensor]:
         if value is None:
             return None
         if isinstance(value, torch.Tensor):
-            return value
+            return _scalarize_loss_tensor(value)
         if isinstance(value, Mapping):
             total = None
             for nested in value.values():
@@ -84,23 +92,27 @@ def _extract_loss_tensor(loss_output: Any, task: str) -> Optional[torch.Tensor]:
     if loss_output is None:
         return None
     if isinstance(loss_output, torch.Tensor):
-        return loss_output
+        return _scalarize_loss_tensor(loss_output)
     if isinstance(loss_output, Mapping):
         loss = loss_output.get('loss')
-        if isinstance(loss, torch.Tensor):
-            return loss
-        for key in ('weighted_loss', 'total_loss', 'final_loss', 'origin_loss'):
+        if isinstance(loss, torch.Tensor) and loss.numel() == 1:
+            return _scalarize_loss_tensor(loss)
+        for key in ('total_loss', 'final_loss', 'weighted_loss', 'origin_loss'):
             tensor = _sum_tensors(loss_output.get(key))
             if tensor is not None:
                 return tensor
+        if isinstance(loss, torch.Tensor):
+            return _scalarize_loss_tensor(loss)
         raise TypeError(f'Loss mapping for task "{task}" must contain a tensor field named "loss".')
     loss = getattr(loss_output, 'loss', None)
-    if isinstance(loss, torch.Tensor):
-        return loss
-    for attr_name in ('weighted_loss', 'total_loss', 'final_loss', 'origin_loss'):
+    if isinstance(loss, torch.Tensor) and loss.numel() == 1:
+        return _scalarize_loss_tensor(loss)
+    for attr_name in ('total_loss', 'final_loss', 'weighted_loss', 'origin_loss'):
         tensor = _sum_tensors(getattr(loss_output, attr_name, None))
         if tensor is not None:
             return tensor
+    if isinstance(loss, torch.Tensor):
+        return _scalarize_loss_tensor(loss)
     raise TypeError(f'Unsupported auxiliary loss output type for task "{task}": {type(loss_output)!r}.')
 
 
@@ -295,6 +307,7 @@ def attach_auxiliary_modules(model: nn.Module, aux_config: Optional[Dict[str, ob
             aux_state['weighted_aux_loss'] = weighted_total
             set_value(outputs, 'aux_loss', total)
             if weighted_total is not None:
+                set_value(outputs, 'aux_weighted_loss', weighted_total)
                 set_value(outputs, 'loss', weighted_total)
             set_aux_state(self, aux_state)
         return outputs
@@ -316,7 +329,7 @@ def qwen3vl_aux_loss(outputs, labels, num_items_in_batch=None, trainer=None, **k
     loss = lm_loss_weight * lm_loss
     task_losses = collect_task_losses_from_outputs(outputs, AUX_TASKS) or dict(aux_state.get('task_losses') or {})
     task_weights = get_value(outputs, 'aux_loss_weights', None) or dict(aux_state.get('task_weights') or {})
-    weighted_aux_loss = get_value(outputs, 'loss', None)
+    weighted_aux_loss = get_value(outputs, 'aux_weighted_loss', None)
     if weighted_aux_loss is None:
         weighted_aux_loss = aux_state.get('weighted_aux_loss')
     loss_items = dict(aux_state.get('loss_items') or {})
@@ -335,16 +348,18 @@ def qwen3vl_aux_loss(outputs, labels, num_items_in_batch=None, trainer=None, **k
             trainer.custom_metrics[mode][f'{task}_aux_loss'].update(task_loss.detach())
         aux_total = task_loss if aux_total is None else aux_total + task_loss
         if weighted_aux_loss is None:
+            task_loss = _scalarize_loss_tensor(task_loss.to(device=loss.device, dtype=loss.dtype))
             loss = loss + float(task_weights.get(task, 1.0)) * task_loss
     if isinstance(weighted_aux_loss, torch.Tensor):
-        loss = loss + weighted_aux_loss.to(loss.device)
+        weighted_aux_loss = weighted_aux_loss.to(device=loss.device, dtype=loss.dtype)
+        loss = loss + _scalarize_loss_tensor(weighted_aux_loss)
     if aux_total is None:
         aux_total = get_value(outputs, 'aux_loss', None)
     if aux_total is None:
         aux_total = aux_state.get('aux_total')
     if trainer is not None and isinstance(aux_total, torch.Tensor):
         trainer.custom_metrics[mode]['aux_loss'].update(aux_total.detach())
-    return loss
+    return _scalarize_loss_tensor(loss)
 
 
 class Qwen3VLAuxTuner(Tuner):
