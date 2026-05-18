@@ -10,6 +10,7 @@ import argparse
 import json
 import os
 from collections import Counter
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, ThreadPoolExecutor, wait
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
@@ -47,6 +48,8 @@ DEFAULT_LABEL_PATH_KEYS = ('labels_path', 'aux_label_path', 'label_path', 'src_l
 DEFAULT_LABEL_FORMAT = 'auto'
 DEFAULT_SRC_LABEL_PATH = '2,0'
 DEFAULT_MAX_EXAMPLES = 10
+DEFAULT_NUM_WORKERS = max(1, min(8, os.cpu_count() or 1))
+DEFAULT_CHUNK_SIZE = 512
 
 # BevAuxLoss.forward currently requires these fields when bev_distill=True.
 # bevseg_cache_valid and bev_feat_cache_valid are optional masks.
@@ -232,6 +235,195 @@ def default_output_path(input_path: str) -> str:
     return f'{input_path}.filtered.jsonl'
 
 
+def new_stats() -> Dict[str, int]:
+    return {
+        'total': 0,
+        'kept': 0,
+        'dropped': 0,
+        'blank': 0,
+        'invalid_json': 0,
+        'label_load_errors': 0,
+    }
+
+
+def process_chunk(chunk: List[Tuple[int, str]], settings: Dict[str, Any]) -> Dict[str, Any]:
+    required_keys = settings['required_keys']
+    label_path_keys = settings['label_path_keys']
+    label_format = settings['label_format']
+    src_label_path = settings['src_label_path']
+    allow_empty = settings['allow_empty']
+    max_examples = settings['max_examples']
+
+    label_cache: Dict[str, Any] = {}
+    stats = new_stats()
+    missing_counter: Counter = Counter()
+    dropped_examples = []
+    kept_lines = []
+
+    for line_no, raw_line in chunk:
+        if not raw_line.strip():
+            stats['blank'] += 1
+            continue
+        stats['total'] += 1
+        try:
+            record = json.loads(raw_line)
+        except json.JSONDecodeError as exc:
+            stats['invalid_json'] += 1
+            stats['dropped'] += 1
+            if len(dropped_examples) < max_examples:
+                dropped_examples.append((line_no, ['<invalid_json>'], str(exc), None))
+            continue
+        if not isinstance(record, dict):
+            stats['dropped'] += 1
+            missing_counter['<record_not_object>'] += 1
+            if len(dropped_examples) < max_examples:
+                dropped_examples.append((line_no, ['<record_not_object>'], None, None))
+            continue
+
+        sources = [record]
+        label_error: Optional[str] = None
+        first_label_path: Optional[str] = None
+        for _, label_path in iter_path_values(record, label_path_keys):
+            first_label_path = first_label_path or label_path
+            try:
+                if label_path not in label_cache:
+                    label_cache[label_path] = load_label(label_path, label_format, src_label_path)
+                sources.append(label_cache[label_path])
+            except Exception as exc:
+                stats['label_load_errors'] += 1
+                label_error = f'{type(exc).__name__}: {exc}'
+
+        missing = [
+            key for key in required_keys if not any(has_required_path(source, key, allow_empty) for source in sources)
+        ]
+        if missing:
+            stats['dropped'] += 1
+            missing_counter.update(missing)
+            if label_error:
+                missing_counter['<label_load_error>'] += 1
+            if len(dropped_examples) < max_examples:
+                dropped_examples.append((line_no, missing, label_error, first_label_path))
+            continue
+
+        stats['kept'] += 1
+        kept_lines.append(raw_line)
+
+    return {
+        'stats': stats,
+        'missing_counter': dict(missing_counter),
+        'dropped_examples': dropped_examples,
+        'kept_lines': kept_lines,
+    }
+
+
+def iter_chunks(input_path: str, chunk_size: int) -> Iterable[List[Tuple[int, str]]]:
+    chunk: List[Tuple[int, str]] = []
+    with open(input_path, 'r', encoding='utf-8') as in_f:
+        for line_no, line in enumerate(in_f, 1):
+            chunk.append((line_no, line.rstrip('\n')))
+            if len(chunk) >= chunk_size:
+                yield chunk
+                chunk = []
+    if chunk:
+        yield chunk
+
+
+def merge_result(
+    result: Dict[str, Any],
+    stats: Dict[str, int],
+    missing_counter: Counter,
+    dropped_examples: List[Tuple[int, List[str], Optional[str], Optional[str]]],
+    max_examples: int,
+) -> None:
+    for key, value in result['stats'].items():
+        stats[key] += value
+    missing_counter.update(result['missing_counter'])
+    remaining = max(0, max_examples - len(dropped_examples))
+    if remaining:
+        dropped_examples.extend(result['dropped_examples'][:remaining])
+
+
+def write_kept_lines(out_f: Optional[Any], kept_lines: Sequence[str]) -> None:
+    if out_f is None:
+        return
+    for raw_line in kept_lines:
+        out_f.write(raw_line + '\n')
+
+
+def run_sequential(input_path: str, out_f: Optional[Any], settings: Dict[str, Any], chunk_size: int) -> Dict[str, Any]:
+    stats = new_stats()
+    missing_counter: Counter = Counter()
+    dropped_examples = []
+    for chunk in iter_chunks(input_path, chunk_size):
+        result = process_chunk(chunk, settings)
+        merge_result(result, stats, missing_counter, dropped_examples, settings['max_examples'])
+        write_kept_lines(out_f, result['kept_lines'])
+    return {
+        'stats': stats,
+        'missing_counter': missing_counter,
+        'dropped_examples': dropped_examples,
+    }
+
+
+def run_parallel(
+    input_path: str,
+    out_f: Optional[Any],
+    settings: Dict[str, Any],
+    *,
+    chunk_size: int,
+    num_workers: int,
+    unordered: bool,
+    backend: str,
+) -> Dict[str, Any]:
+    stats = new_stats()
+    missing_counter: Counter = Counter()
+    dropped_examples = []
+    max_pending = max(num_workers * 4, num_workers)
+    pending = {}
+    ready: Dict[int, Dict[str, Any]] = {}
+    next_to_write = 0
+    next_index = 0
+    chunks = iter_chunks(input_path, chunk_size)
+
+    def submit_available(executor: ProcessPoolExecutor) -> None:
+        nonlocal next_index
+        while len(pending) < max_pending:
+            try:
+                chunk = next(chunks)
+            except StopIteration:
+                return
+            future = executor.submit(process_chunk, chunk, settings)
+            pending[future] = next_index
+            next_index += 1
+
+    executor_cls = ProcessPoolExecutor if backend == 'process' else ThreadPoolExecutor
+    with executor_cls(max_workers=num_workers) as executor:
+        submit_available(executor)
+        while pending:
+            done, _ = wait(pending, return_when=FIRST_COMPLETED)
+            for future in done:
+                index = pending.pop(future)
+                result = future.result()
+                if unordered:
+                    merge_result(result, stats, missing_counter, dropped_examples, settings['max_examples'])
+                    write_kept_lines(out_f, result['kept_lines'])
+                else:
+                    ready[index] = result
+            if not unordered:
+                while next_to_write in ready:
+                    result = ready.pop(next_to_write)
+                    merge_result(result, stats, missing_counter, dropped_examples, settings['max_examples'])
+                    write_kept_lines(out_f, result['kept_lines'])
+                    next_to_write += 1
+            submit_available(executor)
+
+    return {
+        'stats': stats,
+        'missing_counter': missing_counter,
+        'dropped_examples': dropped_examples,
+    }
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description='Filter JSONL samples missing required auxiliary label keys.')
     parser.add_argument('jsonl', help='Input JSONL file.')
@@ -261,6 +453,24 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--allow-empty', action='store_true', help='Treat present-but-empty values as valid.')
     parser.add_argument('--dry-run', action='store_true', help='Only print statistics; do not write output.')
     parser.add_argument('--max-examples', type=int, default=DEFAULT_MAX_EXAMPLES, help='Max dropped examples to print.')
+    parser.add_argument(
+        '--num-workers',
+        type=int,
+        default=DEFAULT_NUM_WORKERS,
+        help='Number of parallel workers. Use 1 to disable parallelism.',
+    )
+    parser.add_argument('--chunk-size', type=int, default=DEFAULT_CHUNK_SIZE, help='JSONL lines per worker task.')
+    parser.add_argument(
+        '--parallel-backend',
+        choices=('process', 'thread'),
+        default='process',
+        help='Parallel backend. process is better for CPU-heavy decoding; thread is useful for I/O-heavy label loads.',
+    )
+    parser.add_argument(
+        '--unordered',
+        action='store_true',
+        help='Write kept rows as soon as chunks finish. Faster, but output order may differ from input.',
+    )
     return parser
 
 
@@ -272,87 +482,80 @@ def main() -> None:
     output_path = args.output or default_output_path(input_path)
     if not args.dry_run and os.path.abspath(input_path) == os.path.abspath(output_path):
         raise ValueError('Output path must be different from input path.')
+    if args.num_workers < 1:
+        raise ValueError('--num-workers must be >= 1.')
+    if args.chunk_size < 1:
+        raise ValueError('--chunk-size must be >= 1.')
 
     required_keys = collect_required_keys(args)
     label_path_keys = tuple(args.label_path_key or DEFAULT_LABEL_PATH_KEYS)
     src_label_path = parse_path_spec(args.src_label_path)
-    label_cache: Dict[str, Any] = {}
-
-    total = kept = dropped = blank = invalid_json = label_load_errors = 0
-    missing_counter: Counter[str] = Counter()
-    dropped_examples = []
+    settings = {
+        'required_keys': required_keys,
+        'label_path_keys': label_path_keys,
+        'label_format': args.label_format,
+        'src_label_path': src_label_path,
+        'allow_empty': args.allow_empty,
+        'max_examples': args.max_examples,
+    }
 
     out_f = None if args.dry_run else open(output_path, 'w', encoding='utf-8')
+    parallel_backend = args.parallel_backend
     try:
-        with open(input_path, 'r', encoding='utf-8') as in_f:
-            for line_no, line in enumerate(in_f, 1):
-                raw_line = line.rstrip('\n')
-                if not raw_line.strip():
-                    blank += 1
-                    continue
-                total += 1
-                try:
-                    record = json.loads(raw_line)
-                except json.JSONDecodeError as exc:
-                    invalid_json += 1
-                    dropped += 1
-                    if len(dropped_examples) < args.max_examples:
-                        dropped_examples.append((line_no, ['<invalid_json>'], str(exc), None))
-                    continue
-                if not isinstance(record, dict):
-                    dropped += 1
-                    missing_counter['<record_not_object>'] += 1
-                    if len(dropped_examples) < args.max_examples:
-                        dropped_examples.append((line_no, ['<record_not_object>'], None, None))
-                    continue
-
-                sources = [record]
-                label_error: Optional[str] = None
-                first_label_path: Optional[str] = None
-                for _, label_path in iter_path_values(record, label_path_keys):
-                    first_label_path = first_label_path or label_path
-                    try:
-                        if label_path not in label_cache:
-                            label_cache[label_path] = load_label(label_path, args.label_format, src_label_path)
-                        sources.append(label_cache[label_path])
-                    except Exception as exc:
-                        label_load_errors += 1
-                        label_error = f'{type(exc).__name__}: {exc}'
-
-                missing = [
-                    key for key in required_keys
-                    if not any(has_required_path(source, key, args.allow_empty) for source in sources)
-                ]
-                if missing:
-                    dropped += 1
-                    missing_counter.update(missing)
-                    if label_error:
-                        missing_counter['<label_load_error>'] += 1
-                    if len(dropped_examples) < args.max_examples:
-                        dropped_examples.append((line_no, missing, label_error, first_label_path))
-                    continue
-
-                kept += 1
-                if out_f is not None:
-                    out_f.write(raw_line + '\n')
+        if args.num_workers == 1:
+            result = run_sequential(input_path, out_f, settings, args.chunk_size)
+        else:
+            try:
+                result = run_parallel(
+                    input_path,
+                    out_f,
+                    settings,
+                    chunk_size=args.chunk_size,
+                    num_workers=args.num_workers,
+                    unordered=args.unordered,
+                    backend=parallel_backend,
+                )
+            except PermissionError:
+                if parallel_backend != 'process':
+                    raise
+                parallel_backend = 'thread'
+                print('warning: process backend is unavailable; falling back to thread backend.')
+                result = run_parallel(
+                    input_path,
+                    out_f,
+                    settings,
+                    chunk_size=args.chunk_size,
+                    num_workers=args.num_workers,
+                    unordered=args.unordered,
+                    backend=parallel_backend,
+                )
     finally:
         if out_f is not None:
             out_f.close()
 
+    stats = result['stats']
+    missing_counter = result['missing_counter']
+    dropped_examples = result['dropped_examples']
+    total = stats['total']
+
     print(f'input: {input_path}')
     print(f'output: {output_path if not args.dry_run else "<dry-run>"}')
+    print(f'num_workers: {args.num_workers}')
+    print(f'chunk_size: {args.chunk_size}')
+    print(f'parallel_backend: {parallel_backend if args.num_workers > 1 else "none"}')
+    print(f'unordered: {args.unordered}')
     print(f'required_keys: {", ".join(required_keys)}')
     print(f'label_path_keys: {", ".join(label_path_keys)}')
     print(f'src_label_path: {src_label_path}')
-    print(f'total_nonblank_lines: {total}')
-    print(f'kept: {kept}')
-    print(f'dropped: {dropped}')
-    print(f'blank_lines_skipped: {blank}')
-    print(f'invalid_json: {invalid_json}')
-    print(f'label_load_errors: {label_load_errors}')
+    print(f'total_nonblank_lines: {stats["total"]}')
+    print(f'kept: {stats["kept"]}')
+    print(f'dropped: {stats["dropped"]}')
+    print(f'blank_lines_skipped: {stats["blank"]}')
+    print(f'invalid_json: {stats["invalid_json"]}')
+    print(f'label_load_errors: {stats["label_load_errors"]}')
     if total:
-        print(f'kept_ratio: {kept / total:.6f}')
-        print(f'dropped_ratio: {dropped / total:.6f}')
+        print(f'kept_ratio: {stats["kept"] / total:.6f}')
+        print(f'dropped_ratio: {stats["dropped"] / total:.6f}')
     if missing_counter:
         print('drop_reasons:')
         for key, count in missing_counter.most_common():
