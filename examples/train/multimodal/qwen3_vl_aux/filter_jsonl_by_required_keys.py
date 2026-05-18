@@ -9,6 +9,7 @@ the Qwen3-VL aux label loader. Kept records are written unchanged.
 import argparse
 import json
 import os
+import sys
 from collections import Counter
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, ThreadPoolExecutor, wait
 from io import BytesIO
@@ -50,6 +51,7 @@ DEFAULT_SRC_LABEL_PATH = '2,0'
 DEFAULT_MAX_EXAMPLES = 10
 DEFAULT_NUM_WORKERS = max(1, min(8, os.cpu_count() or 1))
 DEFAULT_CHUNK_SIZE = 512
+DEFAULT_PROGRESS_MIN_INTERVAL_BYTES = 8 * 1024 * 1024
 
 # BevAuxLoss.forward currently requires these fields when bev_distill=True.
 # bevseg_cache_valid and bev_feat_cache_valid are optional masks.
@@ -235,6 +237,56 @@ def default_output_path(input_path: str) -> str:
     return f'{input_path}.filtered.jsonl'
 
 
+class ProgressReporter:
+
+    def __init__(self, *, total_bytes: int, enabled: bool):
+        self.total_bytes = max(0, total_bytes)
+        self.enabled = enabled and self.total_bytes > 0
+        self.processed_bytes = 0
+        self._bar = None
+        self._last_reported_bytes = 0
+        if not self.enabled:
+            return
+        try:
+            from tqdm import tqdm
+            self._bar = tqdm(total=self.total_bytes, unit='B', unit_scale=True, desc='filter', dynamic_ncols=True)
+        except Exception:
+            self._bar = None
+            self._print_progress(force=True)
+
+    def update(self, amount: int) -> None:
+        if not self.enabled or amount <= 0:
+            return
+        self.processed_bytes += amount
+        if self._bar is not None:
+            self._bar.update(amount)
+            return
+        threshold = max(self.total_bytes // 100, DEFAULT_PROGRESS_MIN_INTERVAL_BYTES)
+        if self.processed_bytes - self._last_reported_bytes >= threshold or self.processed_bytes >= self.total_bytes:
+            self._print_progress(force=self.processed_bytes >= self.total_bytes)
+
+    def close(self) -> None:
+        if not self.enabled:
+            return
+        if self._bar is not None:
+            self._bar.close()
+        else:
+            self._print_progress(force=True)
+            sys.stderr.write('\n')
+            sys.stderr.flush()
+
+    def _print_progress(self, *, force: bool = False) -> None:
+        if not self.enabled:
+            return
+        processed = min(self.processed_bytes, self.total_bytes)
+        if not force and processed == self._last_reported_bytes:
+            return
+        percent = 100.0 * processed / self.total_bytes if self.total_bytes else 100.0
+        sys.stderr.write(f'\rfilter: {processed}/{self.total_bytes} bytes ({percent:.2f}%)')
+        sys.stderr.flush()
+        self._last_reported_bytes = processed
+
+
 def new_stats() -> Dict[str, int]:
     return {
         'total': 0,
@@ -316,16 +368,19 @@ def process_chunk(chunk: List[Tuple[int, str]], settings: Dict[str, Any]) -> Dic
     }
 
 
-def iter_chunks(input_path: str, chunk_size: int) -> Iterable[List[Tuple[int, str]]]:
+def iter_chunks(input_path: str, chunk_size: int) -> Iterable[Tuple[List[Tuple[int, str]], int]]:
     chunk: List[Tuple[int, str]] = []
+    chunk_bytes = 0
     with open(input_path, 'r', encoding='utf-8') as in_f:
         for line_no, line in enumerate(in_f, 1):
+            chunk_bytes += len(line.encode('utf-8'))
             chunk.append((line_no, line.rstrip('\n')))
             if len(chunk) >= chunk_size:
-                yield chunk
+                yield chunk, chunk_bytes
                 chunk = []
+                chunk_bytes = 0
     if chunk:
-        yield chunk
+        yield chunk, chunk_bytes
 
 
 def merge_result(
@@ -350,14 +405,21 @@ def write_kept_lines(out_f: Optional[Any], kept_lines: Sequence[str]) -> None:
         out_f.write(raw_line + '\n')
 
 
-def run_sequential(input_path: str, out_f: Optional[Any], settings: Dict[str, Any], chunk_size: int) -> Dict[str, Any]:
+def run_sequential(
+    input_path: str,
+    out_f: Optional[Any],
+    settings: Dict[str, Any],
+    chunk_size: int,
+    progress: ProgressReporter,
+) -> Dict[str, Any]:
     stats = new_stats()
     missing_counter: Counter = Counter()
     dropped_examples = []
-    for chunk in iter_chunks(input_path, chunk_size):
+    for chunk, chunk_bytes in iter_chunks(input_path, chunk_size):
         result = process_chunk(chunk, settings)
         merge_result(result, stats, missing_counter, dropped_examples, settings['max_examples'])
         write_kept_lines(out_f, result['kept_lines'])
+        progress.update(chunk_bytes)
     return {
         'stats': stats,
         'missing_counter': missing_counter,
@@ -374,6 +436,7 @@ def run_parallel(
     num_workers: int,
     unordered: bool,
     backend: str,
+    progress: ProgressReporter,
 ) -> Dict[str, Any]:
     stats = new_stats()
     missing_counter: Counter = Counter()
@@ -389,11 +452,11 @@ def run_parallel(
         nonlocal next_index
         while len(pending) < max_pending:
             try:
-                chunk = next(chunks)
+                chunk, chunk_bytes = next(chunks)
             except StopIteration:
                 return
             future = executor.submit(process_chunk, chunk, settings)
-            pending[future] = next_index
+            pending[future] = (next_index, chunk_bytes)
             next_index += 1
 
     executor_cls = ProcessPoolExecutor if backend == 'process' else ThreadPoolExecutor
@@ -402,18 +465,21 @@ def run_parallel(
         while pending:
             done, _ = wait(pending, return_when=FIRST_COMPLETED)
             for future in done:
-                index = pending.pop(future)
+                index, chunk_bytes = pending.pop(future)
                 result = future.result()
                 if unordered:
                     merge_result(result, stats, missing_counter, dropped_examples, settings['max_examples'])
                     write_kept_lines(out_f, result['kept_lines'])
+                    progress.update(chunk_bytes)
                 else:
-                    ready[index] = result
+                    ready[index] = {'result': result, 'chunk_bytes': chunk_bytes}
             if not unordered:
                 while next_to_write in ready:
-                    result = ready.pop(next_to_write)
+                    ready_item = ready.pop(next_to_write)
+                    result = ready_item['result']
                     merge_result(result, stats, missing_counter, dropped_examples, settings['max_examples'])
                     write_kept_lines(out_f, result['kept_lines'])
+                    progress.update(ready_item['chunk_bytes'])
                     next_to_write += 1
             submit_available(executor)
 
@@ -471,6 +537,7 @@ def build_parser() -> argparse.ArgumentParser:
         action='store_true',
         help='Write kept rows as soon as chunks finish. Faster, but output order may differ from input.',
     )
+    parser.add_argument('--no-progress', action='store_true', help='Disable overall progress display.')
     return parser
 
 
@@ -501,9 +568,11 @@ def main() -> None:
 
     out_f = None if args.dry_run else open(output_path, 'w', encoding='utf-8')
     parallel_backend = args.parallel_backend
+    total_bytes = os.path.getsize(input_path)
+    progress = ProgressReporter(total_bytes=total_bytes, enabled=not args.no_progress)
     try:
         if args.num_workers == 1:
-            result = run_sequential(input_path, out_f, settings, args.chunk_size)
+            result = run_sequential(input_path, out_f, settings, args.chunk_size, progress)
         else:
             try:
                 result = run_parallel(
@@ -514,6 +583,7 @@ def main() -> None:
                     num_workers=args.num_workers,
                     unordered=args.unordered,
                     backend=parallel_backend,
+                    progress=progress,
                 )
             except PermissionError:
                 if parallel_backend != 'process':
@@ -528,8 +598,10 @@ def main() -> None:
                     num_workers=args.num_workers,
                     unordered=args.unordered,
                     backend=parallel_backend,
+                    progress=progress,
                 )
     finally:
+        progress.close()
         if out_f is not None:
             out_f.close()
 
@@ -544,6 +616,7 @@ def main() -> None:
     print(f'chunk_size: {args.chunk_size}')
     print(f'parallel_backend: {parallel_backend if args.num_workers > 1 else "none"}')
     print(f'unordered: {args.unordered}')
+    print(f'progress: {not args.no_progress}')
     print(f'required_keys: {", ".join(required_keys)}')
     print(f'label_path_keys: {", ".join(label_path_keys)}')
     print(f'src_label_path: {src_label_path}')
