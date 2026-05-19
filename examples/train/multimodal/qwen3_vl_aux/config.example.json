@@ -3,7 +3,7 @@
     "enabled_tasks": ["bev", "god"],
     "layer_indices": [6, 13, 20, 27],
     "merge_size": 2,
-    "lm_loss_weight": 1.0,
+    "lm_loss_weight": 0.0,
     "bev_area": [[-45.4, 95.4], [-44.8, 44.8]],
     "god_resolution": 0.8,
     "foundation_resolution": 3.2,

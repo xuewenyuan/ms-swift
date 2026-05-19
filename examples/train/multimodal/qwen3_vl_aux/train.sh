@@ -1,5 +1,6 @@
 QWEN3VL_AUX_CONFIG_PATH=examples/train/multimodal/qwen3_vl_aux/config.example.json \
 QWEN3VL_AUX_HEAD_LR=5e-4 \
+QWEN3VL_AUX_LM_WEIGHT=0 \
 MAX_PIXELS=1003520 \
 swift sft \
     --model Qwen/Qwen3-VL-4B-Instruct \

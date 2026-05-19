@@ -34,6 +34,7 @@ if TYPE_CHECKING:
 
 AUX_HEAD_CONFIG = 'aux_head_config.json'
 AUX_TRAINABLES = 'aux_trainables.safetensors'
+AUX_VIT_TRAINABLES = 'vit.safetensors'
 AUX_MODULE_KEYWORDS = ('aux_heads', 'aux_losses')
 
 
@@ -50,6 +51,10 @@ def _parameter_in_prefixes(name: str, prefixes: Sequence[str]) -> bool:
 
 def _is_aux_parameter_name(name: str) -> bool:
     return any(keyword in name for keyword in AUX_MODULE_KEYWORDS)
+
+
+def _is_vit_or_aligner_parameter_name(model_arch, name: str) -> bool:
+    return _parameter_in_prefixes(name, model_arch.vision_tower + model_arch.aligner)
 
 
 def _get_active_tasks(aux_config: Dict[str, object]) -> Sequence[str]:
@@ -334,20 +339,35 @@ def attach_auxiliary_modules(model: nn.Module, aux_config: Optional[Dict[str, ob
 
 
 def qwen3vl_aux_loss(outputs, labels, num_items_in_batch=None, trainer=None, **kwargs) -> torch.Tensor:
-    lm_loss = cross_entropy_loss_func(outputs, labels, num_items_in_batch=num_items_in_batch, **kwargs)
     target_model = get_target_model(trainer.model) if trainer is not None else None
     aux_state = get_aux_state(outputs, target_model, default_tasks=AUX_TASKS)
     aux_cfg = get_value(outputs, 'aux_plugin_config', None) or aux_state.get('plugin_config')
     lm_loss_weight = 1.0
     if aux_cfg is not None:
         lm_loss_weight = float(aux_cfg['shared'].get('lm_loss_weight', 1.0))
-    loss = lm_loss_weight * lm_loss
     task_losses = collect_task_losses_from_outputs(outputs, AUX_TASKS) or dict(aux_state.get('task_losses') or {})
     task_weights = get_value(outputs, 'aux_loss_weights', None) or dict(aux_state.get('task_weights') or {})
     weighted_aux_loss = get_value(outputs, 'aux_weighted_loss', None)
     if weighted_aux_loss is None:
         weighted_aux_loss = aux_state.get('weighted_aux_loss')
     loss_items = dict(aux_state.get('loss_items') or {})
+    lm_loss = None
+    if lm_loss_weight != 0:
+        lm_loss = cross_entropy_loss_func(outputs, labels, num_items_in_batch=num_items_in_batch, **kwargs)
+        loss = lm_loss_weight * lm_loss
+    else:
+        anchor = weighted_aux_loss
+        if anchor is None:
+            anchor = next((task_loss for task_loss in task_losses.values() if isinstance(task_loss, torch.Tensor)),
+                          None)
+        if anchor is None:
+            anchor = get_value(outputs, 'logits', None)
+        if isinstance(anchor, torch.Tensor):
+            loss = anchor.sum() * 0
+            lm_loss = loss.detach()
+        else:
+            loss = torch.tensor(0.0)
+            lm_loss = loss
     mode = None
     if trainer is not None:
         mode = 'train' if trainer.model.training else 'eval'
@@ -389,10 +409,18 @@ class Qwen3VLAuxTuner(Tuner):
         model = Swift.prepare_model(model, lora_config)
         model = attach_auxiliary_modules(model)
 
-        if _is_true('QWEN3VL_AUX_TRAIN_VISION') or args.vit_lr is not None or args.aligner_lr is not None:
-            for module_prefix in model_arch.vision_tower + model_arch.aligner:
+        train_vision = _is_true('QWEN3VL_AUX_TRAIN_VISION')
+        train_vit = train_vision or args.vit_lr is not None or not args.freeze_vit
+        train_aligner = (train_vision or _is_true('QWEN3VL_AUX_TRAIN_ALIGNER') or args.aligner_lr is not None
+                         or not args.freeze_aligner)
+        if train_vit:
+            for module_prefix in model_arch.vision_tower:
                 deep_getattr(model, module_prefix).requires_grad_(True)
-            logger.info('Enabled full-parameter training for vision tower / aligner.')
+            logger.info('Enabled full-parameter training for vision tower.')
+        if train_aligner:
+            for module_prefix in model_arch.aligner:
+                deep_getattr(model, module_prefix).requires_grad_(True)
+            logger.info('Enabled full-parameter training for aligner.')
         return model
 
     @staticmethod
@@ -403,6 +431,7 @@ class Qwen3VLAuxTuner(Tuner):
         safe_serialization: bool = True,
         **kwargs,
     ) -> None:
+        trainable_parameter_names = {name for name, param in model.named_parameters() if param.requires_grad}
         if state_dict is None:
             state_dict = {n: p.detach().cpu() for n, p in model.named_parameters() if p.requires_grad}
         model.save_pretrained(save_directory, state_dict=state_dict, safe_serialization=safe_serialization, **kwargs)
@@ -414,15 +443,39 @@ class Qwen3VLAuxTuner(Tuner):
 
         aux_state_dict = {}
         for name, value in state_dict.items():
-            if _is_aux_parameter_name(name):
+            if name in trainable_parameter_names and _is_aux_parameter_name(name):
                 aux_state_dict[name] = value
         if aux_state_dict:
             safetensors.torch.save_file(
                 aux_state_dict, os.path.join(save_directory, AUX_TRAINABLES), metadata={'format': 'pt'})
 
+        model_arch = model.model_meta.model_arch
+        vit_state_dict = {
+            name: value
+            for name, value in state_dict.items()
+            if name in trainable_parameter_names and _is_vit_or_aligner_parameter_name(model_arch, name)
+        }
+        if vit_state_dict:
+            safetensors.torch.save_file(
+                vit_state_dict, os.path.join(save_directory, AUX_VIT_TRAINABLES), metadata={'format': 'pt'})
+
     @staticmethod
     def from_pretrained(model: torch.nn.Module, model_id: str, **kwargs) -> torch.nn.Module:
+        is_trainable = bool(kwargs.get('is_trainable', False))
+        load_aux_heads = _is_true('QWEN3VL_AUX_LOAD_HEADS', 'true' if is_trainable else 'false')
         model = Swift.from_pretrained(model, model_id, **kwargs)
+
+        vit_weights_path = os.path.join(model_id, AUX_VIT_TRAINABLES)
+        if os.path.exists(vit_weights_path):
+            state_dict = safetensors.torch.load_file(vit_weights_path)
+            _, unexpected = model.load_state_dict(state_dict, strict=False)
+            logger.info(f'Loaded ViT/aligner trainables from {vit_weights_path}.')
+            if unexpected:
+                logger.warning(f'Unexpected keys when loading ViT/aligner trainables: {unexpected}')
+
+        if not load_aux_heads:
+            return model
+
         aux_config_path = os.path.join(model_id, AUX_HEAD_CONFIG)
         aux_config = None
         if os.path.exists(aux_config_path):

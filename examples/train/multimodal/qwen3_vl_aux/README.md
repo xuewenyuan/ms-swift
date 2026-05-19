@@ -20,6 +20,8 @@
   - 调用公共 `label_loader`
   - 一次性调用 `AuxSeparateHeads`
   - 再按 task 拆分 `bev/god/cog` 的 loss
+  - aux 训练默认关闭 LM 自回归 CE，只优化辅助 loss
+  - 保存 LoRA adapter、ViT/aligner 全参增量和 aux head；merge 给 LM 继续训练时默认不加载 aux head
 - `common/`
   - `label_loader.py`
     - 负责把 `labels_path` 或 task-specific 路径懒加载成实际 label 对象
@@ -43,7 +45,9 @@
   - 按任务拆分 `bev / cog / god`
   - 每个任务目录下放自己的 `AuxHead` 和 `AuxLoss`
 - `train.sh`
-  - 给出最小训练命令样板
+  - 给出最小辅助任务训练命令样板
+- `merge_aux_to_lm.sh`
+  - 将辅助阶段学到的 LoRA 和 ViT/aligner 全参合入 base model，输出可继续训练 LM 的普通模型目录
 
 ## 默认张量流
 
@@ -60,16 +64,18 @@ Qwen3-VL hidden_states
     -> task-specific AuxLoss
 ```
 
-主任务仍然走 `ms-swift` 标准的 LM loss，也就是 assistant 文本里包含的 `action + trajectory` token 监督。
+辅助任务训练默认不走 `ms-swift` 标准的 LM loss，也就是 assistant 文本里的 `action + trajectory` token 不参与自回归 CE。
 
 总 loss 形式：
 
 ```text
-L = L_lm
+L = λ_lm * L_lm
   + λ_bev * L_bev
   + λ_cog * L_cog
   + λ_god * L_god
 ```
+
+其中 `λ_lm` 默认是 `0.0`。如果需要辅助任务和 LM 同训，可以把 `shared.lm_loss_weight` 或环境变量 `QWEN3VL_AUX_LM_WEIGHT` 设成非 0。
 
 ## 推荐数据格式
 
@@ -98,6 +104,8 @@ L = L_lm
   - 必须开启，否则 `y_bev / y_cog / y_god` 不会进入模型 forward
 - `QWEN3VL_AUX_HIDDEN_LAYERS`
   - 默认 `6,13,20,27`
+- `QWEN3VL_AUX_LM_WEIGHT`
+  - 默认 `0`，表示训练辅助任务时关闭 LM 自回归监督
 - `QWEN3VL_AUX_DPT_PATCH_SIZE`
   - 默认 `32`，按 Qwen3-VL merged visual token 的有效 patch stride 来设
 - `QWEN3VL_AUX_DPT_FEATURES`
@@ -112,6 +120,10 @@ L = L_lm
 - `QWEN3VL_GOD_LOSS_WEIGHT`
 - `QWEN3VL_AUX_HEAD_LR`
   - 默认辅助分支学习率
+- `--vit_lr` / `--aligner_lr`
+  - 传入后会解冻 ViT / aligner 做全参训练，并分别进入独立 optimizer group
+- `QWEN3VL_AUX_LOAD_HEADS`
+  - 加载 aux checkpoint 时是否加载 aux head。训练恢复默认 `true`，export/merge 默认 `false`
 - `QWEN3VL_AUX_CONFIG_PATH`
   - 推荐通过一个 JSON 文件集中传辅助任务参数
 - `QWEN3VL_AUX_CONFIG`
@@ -134,7 +146,7 @@ L = L_lm
     "enabled_tasks": ["bev", "god"],
     "layer_indices": [6, 13, 20, 27],
     "merge_size": 2,
-    "lm_loss_weight": 1.0,
+    "lm_loss_weight": 0.0,
     "label_loader": {
       "path_key": "labels_path",
       "format": "mspack",
@@ -190,6 +202,11 @@ L = L_lm
 - 当前 `AuxHead` / `AuxLoss` 已经改成接口骨架，本仓库里不包含你的具体任务实现
 - 当前 `VGGTUpsampler` 仍然是接口骨架，但构造方式已经兼容原始 `AuxSeparateHeads`
 - 当前实现优先保证单图 / 单视频 / 多媒体顺序输入可跑通
+- aux 阶段 checkpoint 中：
+  - 标准 adapter 文件保存 LoRA
+  - `vit.safetensors` 保存 ViT/aligner 全参训练结果
+  - `aux_trainables.safetensors` 只保存 aux head / aux loss 相关权重
+- 如果要把辅助训练结果用于后续 LM 自回归训练，先运行 `merge_aux_to_lm.sh`；该流程会加载 LoRA 和 `vit.safetensors`，合并 LoRA 后保存普通模型权重，且不带 aux head
 - 你后续只需要补齐这几个接口的具体实现：
   - `aux_task/bev/bev_aux_head.py`, `aux_task/bev/bev_aux_loss.py`
   - `aux_task/cog/cog_aux_head.py`, `aux_task/cog/cog_aux_loss.py`

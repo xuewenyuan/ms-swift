@@ -54,7 +54,7 @@ def build_aux_config(target_model) -> Dict[str, Any]:
             'hidden_size': hidden_size,
             'layer_indices': _parse_int_list(os.environ.get('QWEN3VL_AUX_HIDDEN_LAYERS', '6,13,20,27')),
             'merge_size': int(os.environ.get('QWEN3VL_AUX_MERGE_SIZE', os.environ.get('SPATIAL_MERGE_SIZE', '2'))),
-            'lm_loss_weight': float(os.environ.get('QWEN3VL_AUX_LM_WEIGHT', '1.0')),
+            'lm_loss_weight': float(os.environ.get('QWEN3VL_AUX_LM_WEIGHT', '0.0')),
             'enabled_tasks': list(enabled_tasks_env) if enabled_tasks_env else list(AUX_TASKS),
             'bev_area': default_bev_area,
             'god_resolution': default_god_resolution,
