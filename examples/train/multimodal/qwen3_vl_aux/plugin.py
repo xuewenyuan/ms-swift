@@ -305,6 +305,8 @@ def attach_auxiliary_modules(model: nn.Module, aux_config: Optional[Dict[str, ob
             loss_item_metrics = _extract_loss_item_metrics(loss_output)
             if loss_item_metrics:
                 aux_state['loss_items'][task] = loss_item_metrics
+                for name, metric_value in loss_item_metrics.items():
+                    set_value(outputs, f'{task}_{name}', metric_value)
             task_loss = _extract_loss_tensor(loss_output, task)
             aux_state['task_losses'][task] = task_loss
             set_value(outputs, f'{task}_aux_loss', task_loss)

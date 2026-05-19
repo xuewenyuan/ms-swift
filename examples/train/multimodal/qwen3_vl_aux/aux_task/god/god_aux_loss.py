@@ -116,7 +116,7 @@ class GodAuxLoss(nn.Module):
 
             occupancy_loss = occupancy_loss * godseg_valid[..., None, None]
             occupancy_loss = torch.mean(occupancy_loss * occupancy_weights)
-            loss_dict['occupancy'] = occupancy_loss
+            loss_dict['loss_occupancy'] = occupancy_loss
 
         if 'semantic' in self.loss_tasks:
             default_idx = semantic_gt == -1
@@ -128,7 +128,7 @@ class GodAuxLoss(nn.Module):
             godseg_valid = godseg_valid.to(device=semantic_pred.device)
             semantic_loss = self.loss_semantic(semantic_pred, semantic_gt)
             semantic_loss = semantic_loss * godseg_valid[..., None, None]
-            loss_dict['semantic'] = torch.mean(semantic_loss)
+            loss_dict['loss_semantic'] = torch.mean(semantic_loss)
 
         if 'visibility' in self.loss_tasks:
             visibility_gt = gt_dict['visibility']
@@ -142,7 +142,7 @@ class GodAuxLoss(nn.Module):
 
             visibility_loss = self.loss_visibility(visibility_pred, visibility_gt, weight=visibility_class_weight)
             visibility_loss = visibility_loss * godseg_valid[..., None, None, None]
-            loss_dict['visibility'] = torch.mean(visibility_loss)
+            loss_dict['loss_visibility'] = torch.mean(visibility_loss)
 
         if 'drivable' in self.loss_tasks:
             # for drivable area
@@ -166,7 +166,7 @@ class GodAuxLoss(nn.Module):
 
             drivable_loss = self.loss_drivable(drivable_pred, drivable_area_gt, weight=drivable_weights)
             drivable_loss = drivable_loss * godseg_valid[..., None, None]
-            loss_dict['drivable'] = torch.mean(drivable_loss)
+            loss_dict['loss_drivable'] = torch.mean(drivable_loss)
 
         if self.god_distill:
             gt_feat = labels[0]['pnc_god_dense_input'] # [2, 64, 144, 56]
@@ -175,7 +175,7 @@ class GodAuxLoss(nn.Module):
             godfeat_valid = godfeat_valid.to(device=pred_feat.device)
             distill_loss = self.loss_distill(pred_feat, gt_feat)
             distill_loss = distill_loss * godfeat_valid[..., None, None]
-            loss_dict['god_distill'] = torch.mean(distill_loss)
+            loss_dict['loss_distill'] = torch.mean(distill_loss)
 
         origin_loss = []
         loss_weight = []
@@ -184,7 +184,7 @@ class GodAuxLoss(nn.Module):
 
         for k, v in loss_dict.items():
             weight = self.loss_weight
-            if k == 'god_distill':
+            if k == 'loss_distill':
                 weight = self.loss_weight / 3
             weighted_item = v * weight
 

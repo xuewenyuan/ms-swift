@@ -260,11 +260,12 @@ class BevAuxLoss(nn.Module):
             #     logger.warning(f"{e}")
 
         loss_dict = {
-            'loss_heatmap': loss_heatmap, 
-            'loss_bbox': loss_bbox, 
-            'loss_movement': loss_movement, 
-            'distill_loss': torch.mean(distill_loss)
-            }
+            'loss_heatmap': loss_heatmap,
+            'loss_bbox': loss_bbox,
+            'loss_movement': loss_movement,
+        }
+        if self.bev_distill:
+            loss_dict['loss_distill'] = torch.mean(distill_loss)
 
         origin_loss = []
         loss_weight = []
@@ -273,7 +274,7 @@ class BevAuxLoss(nn.Module):
 
         for k, v in loss_dict.items():
             weight = self.loss_weight
-            if k == 'distill_loss':
+            if k == 'loss_distill':
                 weight = self.loss_weight / 3
             weighted_item = v * weight
  
