@@ -200,13 +200,6 @@ def _extract_loss_item_metrics(loss_output: Any) -> Dict[str, Any]:
     return metrics
 
 
-def _attach_aux_state_to_outputs(outputs: Any, aux_state: Dict[str, Any]) -> None:
-    try:
-        setattr(outputs, AUX_STATE_ATTR, aux_state)
-    except Exception:
-        pass
-
-
 def _pop_label_path_inputs(kwargs: Dict[str, object], preferred_key: str) -> Dict[str, object]:
     label_inputs = {}
     candidate_keys = [preferred_key, 'aux_label_path', 'labels_path', 'label_path', 'src_label_path', 'labels_file']
@@ -351,7 +344,6 @@ def attach_auxiliary_modules(model: nn.Module, aux_config: Optional[Dict[str, ob
             aux_state['task_losses'][task] = task_loss
             set_value(outputs, f'{task}_aux_loss', task_loss)
             set_aux_state(self, aux_state)
-            _attach_aux_state_to_outputs(outputs, aux_state)
 
         loss_values = [loss for loss in aux_state['task_losses'].values() if loss is not None]
         if loss_values:
@@ -374,7 +366,6 @@ def attach_auxiliary_modules(model: nn.Module, aux_config: Optional[Dict[str, ob
                 set_value(outputs, 'aux_weighted_loss', weighted_total)
                 set_value(outputs, 'loss', weighted_total)
             set_aux_state(self, aux_state)
-            _attach_aux_state_to_outputs(outputs, aux_state)
         return outputs
 
     target_model.forward = MethodType(forward, target_model)
@@ -443,14 +434,9 @@ def qwen3vl_aux_loss(outputs, labels, num_items_in_batch=None, trainer=None, **k
     loss = _scalarize_loss_tensor(loss)
     loss_scale = _get_trainer_loss_scale(trainer, num_items_in_batch)
     loss_for_trainer = loss / loss_scale
-    if trainer is not None:
-        if isinstance(aux_total, torch.Tensor):
+    if trainer is not None and isinstance(aux_total, torch.Tensor):
+        if get_value(outputs, 'aux_loss', None) is None:
             trainer.custom_metrics[mode]['aux_loss'].update(aux_total.detach())
-        trainer.custom_metrics[mode]['objective_loss'].update(loss.detach())
-        trainer.custom_metrics[mode]['loss_scale_factor'].update(loss_scale)
-        trainer.custom_metrics[mode]['loss_returned_to_trainer'].update(loss_for_trainer.detach())
-        if num_items_in_batch is not None:
-            trainer.custom_metrics[mode]['num_items_in_batch'].update(num_items_in_batch)
     return loss_for_trainer
 
 
@@ -567,7 +553,7 @@ class Qwen3VLAuxTuner(Tuner):
         return model
 
 
-def create_qwen3vl_aux_optimizer(args: 'TrainArguments', model, dataset):
+def create_qwen3vl_aux_optimizer(args: 'TrainArguments', model, _dataset):
     decay_parameters = set(Trainer.get_decay_parameter_names(None, model))
     model_arch = model.model_meta.model_arch
     aux_head_lr = get_aux_head_lr(args.learning_rate)
