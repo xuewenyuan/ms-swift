@@ -35,7 +35,7 @@
       "enabled": true,
       "label_key": "y_bev",
       "label_keys": [],
-      "loss_weight": 1.0,
+      "train_weight": 1.0,
       "head": {
         "in_channels": 128,
         "out_channels": 64,
@@ -106,7 +106,7 @@
       "enabled": false,
       "label_key": "y_cog",
       "label_keys": [],
-      "loss_weight": 1.0,
+      "train_weight": 1.0,
       "head": {},
       "loss": {}
     },
@@ -114,7 +114,7 @@
       "enabled": true,
       "label_key": "y_god",
       "label_keys": [],
-      "loss_weight": 5.0,
+      "train_weight": 5.0,
       "head": {
         "in_channels": 128,
         "out_channels": 128,

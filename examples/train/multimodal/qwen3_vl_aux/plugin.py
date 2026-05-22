@@ -76,14 +76,21 @@ def _get_loss_weight(task_weights: Mapping[str, object], task: str) -> float:
     return 0.0 if _is_zero_number(weight) else float(weight)
 
 
-def _get_configured_loss_weight(task_cfg: Mapping[str, object]) -> float:
-    weight = task_cfg.get('loss_weight', 1.0)
-    if _is_zero_number(weight):
-        return 0.0
-    loss_cfg = task_cfg.get('loss')
-    if isinstance(loss_cfg, Mapping) and _is_zero_number(loss_cfg.get('loss_weight')):
-        return 0.0
-    return float(weight)
+def _get_task_train_weight(task_cfg: Mapping[str, object]) -> float:
+    for key in ('train_weight', 'task_weight', 'loss_weight'):
+        if key in task_cfg:
+            weight = task_cfg[key]
+            return 0.0 if _is_zero_number(weight) else float(weight)
+    return 1.0
+
+
+def _get_trainer_loss_scale(trainer, num_items_in_batch) -> float:
+    if trainer is None or num_items_in_batch is None:
+        return 1.0
+    if (getattr(trainer.args, 'average_tokens_across_devices', False)
+            and getattr(trainer, 'model_accepts_loss_kwargs', False)):
+        return float(trainer.accelerator.num_processes)
+    return 1.0
 
 
 def _scalarize_loss_tensor(loss: torch.Tensor) -> torch.Tensor:
@@ -273,7 +280,7 @@ def attach_auxiliary_modules(model: nn.Module, aux_config: Optional[Dict[str, ob
 
         aux_features = {'hidden_states': hidden_states}
         task_weights = {
-            task: _get_configured_loss_weight(self.aux_head_config['tasks'][task]) for task in active_tasks
+            task: _get_task_train_weight(self.aux_head_config['tasks'][task]) for task in active_tasks
         }
         aux_state['task_weights'] = task_weights
         set_value(outputs, 'aux_features', aux_features)
@@ -433,9 +440,17 @@ def qwen3vl_aux_loss(outputs, labels, num_items_in_batch=None, trainer=None, **k
         aux_total = get_value(outputs, 'aux_loss', None)
     if aux_total is None:
         aux_total = aux_state.get('aux_total')
-    if trainer is not None and isinstance(aux_total, torch.Tensor):
-        trainer.custom_metrics[mode]['aux_loss'].update(aux_total.detach())
-    return _scalarize_loss_tensor(loss)
+    loss = _scalarize_loss_tensor(loss)
+    loss_scale = _get_trainer_loss_scale(trainer, num_items_in_batch)
+    loss_for_trainer = loss / loss_scale
+    if trainer is not None:
+        if isinstance(aux_total, torch.Tensor):
+            trainer.custom_metrics[mode]['aux_loss'].update(aux_total.detach())
+        trainer.custom_metrics[mode]['objective_loss'].update(loss.detach())
+        if loss_scale != 1.0:
+            trainer.custom_metrics[mode]['loss_scale_factor'].update(loss_scale)
+            trainer.custom_metrics[mode]['loss_returned_to_trainer'].update(loss_for_trainer.detach())
+    return loss_for_trainer
 
 
 class Qwen3VLAuxTuner(Tuner):

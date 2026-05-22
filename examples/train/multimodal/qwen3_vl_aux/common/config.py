@@ -74,7 +74,9 @@ def _apply_env_overrides(config: Dict[str, Any]) -> Dict[str, Any]:
     for task in AUX_TASKS:
         task_cfg = tasks_cfg.setdefault(task, {})
         if _has_env(f'QWEN3VL_{task.upper()}_LOSS_WEIGHT'):
-            task_cfg['loss_weight'] = float(os.environ[f'QWEN3VL_{task.upper()}_LOSS_WEIGHT'])
+            loss_weight = float(os.environ[f'QWEN3VL_{task.upper()}_LOSS_WEIGHT'])
+            task_cfg['train_weight'] = loss_weight
+            task_cfg['loss_weight'] = loss_weight
         if _has_env(f'QWEN3VL_{task.upper()}_NUM_CLASSES'):
             task_cfg.setdefault('head', {})['num_classes'] = int(os.environ[f'QWEN3VL_{task.upper()}_NUM_CLASSES'])
     return config

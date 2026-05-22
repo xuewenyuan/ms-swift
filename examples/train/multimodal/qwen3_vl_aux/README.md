@@ -75,7 +75,9 @@ L = λ_lm * L_lm
   + λ_god * L_god
 ```
 
-其中 `λ_lm` 默认是 `0.0`。如果需要辅助任务和 LM 同训，可以把 `shared.lm_loss_weight` 或环境变量 `QWEN3VL_AUX_LM_WEIGHT` 设成非 0。
+其中 `λ_lm` 默认是 `0.0`。如果需要辅助任务和 LM 同训，可以把 `shared.lm_loss_weight` 或环境变量 `QWEN3VL_AUX_LM_WEIGHT` 设成非 0。任务级 `λ_bev / λ_cog / λ_god` 推荐写在 `tasks.<task>.train_weight`；旧配置里的外层 `tasks.<task>.loss_weight` 仍然兼容。`tasks.<task>.loss.loss_weight` 属于任务内部 loss 聚合，不建议用它控制任务是否进入最终训练目标。
+
+当 `average_tokens_across_devices=True` 时，SWIFT trainer 会在 custom loss 返回后再乘以进程数；插件会对返回给 trainer 的 loss 做反向补偿，日志里的 `loss` 应该与 `objective_loss` 同量级，`loss_scale_factor` 只用于确认这个补偿因子。
 
 ## 推荐数据格式
 
@@ -166,7 +168,7 @@ L = λ_lm * L_lm
       "enabled": true,
       "label_key": "y_bev",
       "label_keys": [],
-      "loss_weight": 1.0,
+      "train_weight": 1.0,
       "head": {},
       "loss": {}
     },
@@ -174,7 +176,7 @@ L = λ_lm * L_lm
       "enabled": false,
       "label_key": "y_cog",
       "label_keys": [],
-      "loss_weight": 1.0,
+      "train_weight": 1.0,
       "head": {},
       "loss": {}
     },
@@ -182,7 +184,7 @@ L = λ_lm * L_lm
       "enabled": true,
       "label_key": "y_god",
       "label_keys": [],
-      "loss_weight": 1.0,
+      "train_weight": 1.0,
       "head": {},
       "loss": {}
     }
@@ -194,7 +196,7 @@ L = λ_lm * L_lm
 
 - shared 参数只写一次，比如 `layer_indices / merge_size / upsampler_cfg`
 - 可以在 `shared.enabled_tasks` 或 `QWEN3VL_AUX_ENABLED_TASKS` 里统一指定本次启用哪些任务
-- 每个任务只维护自己的 `label_key / label_keys / loss_weight / head / loss`
+- 每个任务只维护自己的 `label_key / label_keys / train_weight / head / loss`
 - 可以用 `enabled=false` 临时关闭还没实现完的任务，比如当前先跳过 `cog`
 - plugin 不需要为了新任务参数继续扩展新的环境变量
 
