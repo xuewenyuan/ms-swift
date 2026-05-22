@@ -35,6 +35,51 @@ def _deep_update(base: Dict[str, Any], updates: Mapping[str, Any]) -> Dict[str, 
     return base
 
 
+def _has_env(env_key: str) -> bool:
+    return env_key in os.environ and os.environ[env_key] != ''
+
+
+def _apply_env_overrides(config: Dict[str, Any]) -> Dict[str, Any]:
+    shared_cfg = config.setdefault('shared', {})
+    if _has_env('QWEN3VL_AUX_HIDDEN_LAYERS'):
+        shared_cfg['layer_indices'] = _parse_int_list(os.environ['QWEN3VL_AUX_HIDDEN_LAYERS'])
+    if _has_env('QWEN3VL_AUX_MERGE_SIZE'):
+        shared_cfg['merge_size'] = int(os.environ['QWEN3VL_AUX_MERGE_SIZE'])
+    elif _has_env('SPATIAL_MERGE_SIZE'):
+        shared_cfg['merge_size'] = int(os.environ['SPATIAL_MERGE_SIZE'])
+    if _has_env('QWEN3VL_AUX_LM_WEIGHT'):
+        shared_cfg['lm_loss_weight'] = float(os.environ['QWEN3VL_AUX_LM_WEIGHT'])
+    if _has_env('QWEN3VL_AUX_ENABLED_TASKS'):
+        shared_cfg['enabled_tasks'] = _parse_task_list(os.environ['QWEN3VL_AUX_ENABLED_TASKS'])
+
+    label_loader_cfg = shared_cfg.setdefault('label_loader', {})
+    if _has_env('QWEN3VL_AUX_LABEL_PATH_KEY'):
+        label_loader_cfg['path_key'] = os.environ['QWEN3VL_AUX_LABEL_PATH_KEY']
+    if _has_env('QWEN3VL_AUX_LABEL_FORMAT'):
+        label_loader_cfg['format'] = os.environ['QWEN3VL_AUX_LABEL_FORMAT']
+    if _has_env('QWEN3VL_AUX_LABEL_CACHE_SIZE'):
+        label_loader_cfg['cache_size'] = int(os.environ['QWEN3VL_AUX_LABEL_CACHE_SIZE'])
+
+    upsampler_cfg = shared_cfg.setdefault('upsampler_cfg', {})
+    if _has_env('QWEN3VL_AUX_UPSAMPLER_TYPE'):
+        upsampler_cfg['type'] = os.environ['QWEN3VL_AUX_UPSAMPLER_TYPE']
+    if _has_env('QWEN3VL_AUX_DPT_PATCH_SIZE'):
+        upsampler_cfg['patch_size'] = int(os.environ['QWEN3VL_AUX_DPT_PATCH_SIZE'])
+    if _has_env('QWEN3VL_AUX_DPT_FEATURES'):
+        upsampler_cfg['features'] = int(os.environ['QWEN3VL_AUX_DPT_FEATURES'])
+    if _has_env('QWEN3VL_AUX_DPT_OUT_CHANNELS'):
+        upsampler_cfg['out_channels'] = _parse_int_list(os.environ['QWEN3VL_AUX_DPT_OUT_CHANNELS'])
+
+    tasks_cfg = config.setdefault('tasks', {})
+    for task in AUX_TASKS:
+        task_cfg = tasks_cfg.setdefault(task, {})
+        if _has_env(f'QWEN3VL_{task.upper()}_LOSS_WEIGHT'):
+            task_cfg['loss_weight'] = float(os.environ[f'QWEN3VL_{task.upper()}_LOSS_WEIGHT'])
+        if _has_env(f'QWEN3VL_{task.upper()}_NUM_CLASSES'):
+            task_cfg.setdefault('head', {})['num_classes'] = int(os.environ[f'QWEN3VL_{task.upper()}_NUM_CLASSES'])
+    return config
+
+
 def get_aux_head_lr(default_lr: float) -> float:
     return float(os.environ.get('QWEN3VL_AUX_HEAD_LR', str(default_lr)))
 
@@ -42,6 +87,7 @@ def get_aux_head_lr(default_lr: float) -> float:
 def build_aux_config(target_model) -> Dict[str, Any]:
     text_config = getattr(target_model.config, 'text_config', target_model.config)
     hidden_size = getattr(text_config, 'hidden_size', None) or getattr(target_model.config, 'hidden_size')
+    has_enabled_tasks_env = _has_env('QWEN3VL_AUX_ENABLED_TASKS')
     enabled_tasks_env = set(_parse_task_list(os.environ.get('QWEN3VL_AUX_ENABLED_TASKS', '')))
     default_bev_area = [[-45.4, 95.4], [-44.8, 44.8]]
     default_common_god_area = [[-19.8, 95.4], [-22.4, 22.4]]
@@ -55,7 +101,7 @@ def build_aux_config(target_model) -> Dict[str, Any]:
             'layer_indices': _parse_int_list(os.environ.get('QWEN3VL_AUX_HIDDEN_LAYERS', '6,13,20,27')),
             'merge_size': int(os.environ.get('QWEN3VL_AUX_MERGE_SIZE', os.environ.get('SPATIAL_MERGE_SIZE', '2'))),
             'lm_loss_weight': float(os.environ.get('QWEN3VL_AUX_LM_WEIGHT', '0.0')),
-            'enabled_tasks': list(enabled_tasks_env) if enabled_tasks_env else list(AUX_TASKS),
+            'enabled_tasks': list(enabled_tasks_env) if has_enabled_tasks_env else None,
             'bev_area': default_bev_area,
             'god_resolution': default_god_resolution,
             'foundation_resolution': default_foundation_resolution,
@@ -79,7 +125,7 @@ def build_aux_config(target_model) -> Dict[str, Any]:
     }
     for task in AUX_TASKS:
         base_config['tasks'][task] = {
-            'enabled': task in enabled_tasks_env if enabled_tasks_env else True,
+            'enabled': task in enabled_tasks_env if has_enabled_tasks_env else True,
             'label_key': f'y_{task}',
             'label_keys': [],
             'loss_weight': float(os.environ.get(f'QWEN3VL_{task.upper()}_LOSS_WEIGHT', '1.0')),
@@ -193,8 +239,9 @@ def build_aux_config(target_model) -> Dict[str, Any]:
 
     user_config = _load_user_config()
     merged = _deep_update(copy.deepcopy(base_config), user_config)
+    merged = _apply_env_overrides(merged)
     enabled_tasks = merged.get('shared', {}).get('enabled_tasks')
-    if enabled_tasks:
+    if enabled_tasks is not None:
         enabled_set = set(enabled_tasks)
         for task in AUX_TASKS:
             merged['tasks'][task]['enabled'] = task in enabled_set

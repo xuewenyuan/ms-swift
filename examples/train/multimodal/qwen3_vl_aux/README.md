@@ -128,6 +128,7 @@ L = λ_lm * L_lm
   - 推荐通过一个 JSON 文件集中传辅助任务参数
 - `QWEN3VL_AUX_CONFIG`
   - 也支持直接传 JSON 字符串，更适合临时调试
+- 显式设置的环境变量会覆盖 JSON 配置，适合临时调整单个实验参数
 - `QWEN3VL_AUX_ENABLED_TASKS`
   - 可选，逗号分隔，比如 `bev,god`
   - 不传时默认按 `tasks.<name>.enabled` 配置生效

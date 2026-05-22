@@ -20,7 +20,7 @@ from common.config import AUX_TASKS, build_aux_config, get_aux_head_lr
 from common.label_loader import Qwen3VLAuxLabelLoader
 from common.plugin_runtime import (AUX_STATE_ATTR, collect_task_losses_from_outputs, get_aux_state, get_target_model,
                                    get_value, make_aux_state, set_aux_state, set_value)
-from swift.llm import deep_getattr, get_multimodal_target_regex
+from swift.llm import deep_getattr
 from swift.plugin import Tuner, extra_tuners, loss_mapping, optimizers_map
 from swift.plugin.loss import cross_entropy_loss_func
 from swift.tuners import LoraConfig, Swift
@@ -60,6 +60,30 @@ def _is_vit_or_aligner_parameter_name(model_arch, name: str) -> bool:
 def _get_active_tasks(aux_config: Dict[str, object]) -> Sequence[str]:
     tasks_cfg = aux_config.get('tasks', {})
     return [task for task in AUX_TASKS if tasks_cfg.get(task, {}).get('enabled', True)]
+
+
+def _is_zero_number(value: object) -> bool:
+    if value is None:
+        return False
+    try:
+        return float(value) == 0.0
+    except (TypeError, ValueError):
+        return False
+
+
+def _get_loss_weight(task_weights: Mapping[str, object], task: str) -> float:
+    weight = task_weights.get(task, 1.0)
+    return 0.0 if _is_zero_number(weight) else float(weight)
+
+
+def _get_configured_loss_weight(task_cfg: Mapping[str, object]) -> float:
+    weight = task_cfg.get('loss_weight', 1.0)
+    if _is_zero_number(weight):
+        return 0.0
+    loss_cfg = task_cfg.get('loss')
+    if isinstance(loss_cfg, Mapping) and _is_zero_number(loss_cfg.get('loss_weight')):
+        return 0.0
+    return float(weight)
 
 
 def _scalarize_loss_tensor(loss: torch.Tensor) -> torch.Tensor:
@@ -200,7 +224,11 @@ def attach_auxiliary_modules(model: nn.Module, aux_config: Optional[Dict[str, ob
 
     aux_config = aux_config or build_aux_config(target_model)
     _attach_task_modules(target_model, aux_config)
-    target_model.to(device=next(target_model.parameters()).device, dtype=next(target_model.parameters()).dtype)
+    reference_param = next(
+        (param for name, param in target_model.named_parameters() if not _is_aux_parameter_name(name)), None)
+    if reference_param is not None:
+        target_model.aux_heads.to(device=reference_param.device, dtype=reference_param.dtype)
+        target_model.aux_losses.to(device=reference_param.device, dtype=reference_param.dtype)
     origin_forward = target_model.forward
 
     def forward(self, *args, y_bev=None, y_cog=None, y_god=None, **kwargs):
@@ -213,7 +241,8 @@ def attach_auxiliary_modules(model: nn.Module, aux_config: Optional[Dict[str, ob
             if label_key not in {'y_bev', 'y_cog', 'y_god'} and label_key in kwargs:
                 extra_task_targets[task] = kwargs.pop(label_key)
         kwargs.setdefault('return_dict', True)
-        kwargs['output_hidden_states'] = True
+        if active_tasks:
+            kwargs['output_hidden_states'] = True
         input_ids = kwargs.get('input_ids')
         if input_ids is None and args:
             input_ids = args[0]
@@ -226,8 +255,12 @@ def attach_auxiliary_modules(model: nn.Module, aux_config: Optional[Dict[str, ob
         set_value(outputs, 'aux_predictions', aux_predictions)
         set_value(outputs, 'aux_task_losses', aux_state['task_losses'])
         set_value(outputs, 'aux_loss', None)
+        set_value(outputs, 'aux_enabled_tasks', list(active_tasks))
+        set_value(outputs, 'aux_loss_weights', {})
         set_aux_state(self, aux_state)
 
+        if not active_tasks:
+            return outputs
         if input_ids is None:
             return outputs
 
@@ -240,7 +273,7 @@ def attach_auxiliary_modules(model: nn.Module, aux_config: Optional[Dict[str, ob
 
         aux_features = {'hidden_states': hidden_states}
         task_weights = {
-            task: self.aux_head_config['tasks'][task]['loss_weight'] for task in active_tasks
+            task: _get_configured_loss_weight(self.aux_head_config['tasks'][task]) for task in active_tasks
         }
         aux_state['task_weights'] = task_weights
         set_value(outputs, 'aux_features', aux_features)
@@ -323,7 +356,10 @@ def attach_auxiliary_modules(model: nn.Module, aux_config: Optional[Dict[str, ob
             for task, task_loss in aux_state['task_losses'].items():
                 if task_loss is None:
                     continue
-                weighted_loss = float(task_weights.get(task, 1.0)) * task_loss
+                loss_weight = _get_loss_weight(task_weights, task)
+                if loss_weight == 0.0:
+                    continue
+                weighted_loss = loss_weight * task_loss
                 weighted_total = weighted_loss if weighted_total is None else weighted_total + weighted_loss
             aux_state['weighted_aux_loss'] = weighted_total
             set_value(outputs, 'aux_loss', total)
@@ -360,10 +396,10 @@ def qwen3vl_aux_loss(outputs, labels, num_items_in_batch=None, trainer=None, **k
     else:
         anchor = weighted_aux_loss
         if anchor is None:
+            anchor = get_value(outputs, 'logits', None)
+        if anchor is None:
             anchor = next((task_loss for task_loss in task_losses.values() if isinstance(task_loss, torch.Tensor)),
                           None)
-        if anchor is None:
-            anchor = get_value(outputs, 'logits', None)
         if isinstance(anchor, torch.Tensor):
             loss = anchor.sum() * 0
             lm_loss = loss.detach()
@@ -385,8 +421,11 @@ def qwen3vl_aux_loss(outputs, labels, num_items_in_batch=None, trainer=None, **k
             trainer.custom_metrics[mode][f'{task}_aux_loss'].update(task_loss.detach())
         aux_total = task_loss if aux_total is None else aux_total + task_loss
         if weighted_aux_loss is None:
+            loss_weight = _get_loss_weight(task_weights, task)
+            if loss_weight == 0.0:
+                continue
             task_loss = _scalarize_loss_tensor(task_loss.to(device=loss.device, dtype=loss.dtype))
-            loss = loss + float(task_weights.get(task, 1.0)) * task_loss
+            loss = loss + loss_weight * task_loss
     if isinstance(weighted_aux_loss, torch.Tensor):
         weighted_aux_loss = weighted_aux_loss.to(device=loss.device, dtype=loss.dtype)
         loss = loss + _scalarize_loss_tensor(weighted_aux_loss)
@@ -404,10 +443,25 @@ class Qwen3VLAuxTuner(Tuner):
     @staticmethod
     def prepare_model(args: 'TrainArguments', model: torch.nn.Module) -> torch.nn.Module:
         model_arch = model.model_meta.model_arch
-        target_regex = get_multimodal_target_regex(model)
-        logger.info(f'target_regex: {target_regex}')
-        lora_config = LoraConfig(
-            task_type='CAUSAL_LM', r=args.lora_rank, lora_alpha=args.lora_alpha, target_modules=target_regex)
+        from swift.llm.train.tuner import get_modules_to_save, get_target_modules
+        target_modules = get_target_modules(args, model)
+        modules_to_save = get_modules_to_save(args, model, 'CAUSAL_LM')
+        lora_kwargs = {
+            'r': args.lora_rank,
+            'target_modules': target_modules,
+            'lora_alpha': args.lora_alpha,
+            'lora_dropout': args.lora_dropout,
+            'bias': args.lora_bias,
+            'modules_to_save': modules_to_save,
+            'use_rslora': args.use_rslora,
+            'use_dora': args.use_dora,
+            'lorap_lr_ratio': args.lorap_lr_ratio,
+            'init_lora_weights': args.init_weights,
+        }
+        if args.target_parameters is not None:
+            lora_kwargs['target_parameters'] = args.target_parameters
+        lora_config = LoraConfig(task_type='CAUSAL_LM', lora_dtype=args.lora_dtype, **lora_kwargs)
+        logger.info(f'lora_config: {lora_config}')
         model = Swift.prepare_model(model, lora_config)
         model = attach_auxiliary_modules(model)
 
