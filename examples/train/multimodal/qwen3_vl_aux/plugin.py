@@ -447,9 +447,10 @@ def qwen3vl_aux_loss(outputs, labels, num_items_in_batch=None, trainer=None, **k
         if isinstance(aux_total, torch.Tensor):
             trainer.custom_metrics[mode]['aux_loss'].update(aux_total.detach())
         trainer.custom_metrics[mode]['objective_loss'].update(loss.detach())
-        if loss_scale != 1.0:
-            trainer.custom_metrics[mode]['loss_scale_factor'].update(loss_scale)
-            trainer.custom_metrics[mode]['loss_returned_to_trainer'].update(loss_for_trainer.detach())
+        trainer.custom_metrics[mode]['loss_scale_factor'].update(loss_scale)
+        trainer.custom_metrics[mode]['loss_returned_to_trainer'].update(loss_for_trainer.detach())
+        if num_items_in_batch is not None:
+            trainer.custom_metrics[mode]['num_items_in_batch'].update(num_items_in_batch)
     return loss_for_trainer
 
 
