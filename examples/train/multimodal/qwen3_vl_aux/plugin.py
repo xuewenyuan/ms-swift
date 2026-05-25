@@ -36,6 +36,7 @@ AUX_HEAD_CONFIG = 'aux_head_config.json'
 AUX_TRAINABLES = 'aux_trainables.safetensors'
 AUX_VIT_TRAINABLES = 'vit.safetensors'
 AUX_MODULE_KEYWORDS = ('aux_heads', 'aux_losses')
+ADAPTER_PARAMETER_KEYWORDS = ('lora_', 'modules_to_save')
 
 
 def _is_true(env_key: str, default: str = 'false') -> bool:
@@ -53,8 +54,17 @@ def _is_aux_parameter_name(name: str) -> bool:
     return any(keyword in name for keyword in AUX_MODULE_KEYWORDS)
 
 
+def _is_adapter_parameter_name(name: str) -> bool:
+    return any(keyword in name for keyword in ADAPTER_PARAMETER_KEYWORDS)
+
+
 def _is_vit_or_aligner_parameter_name(model_arch, name: str) -> bool:
     return _parameter_in_prefixes(name, model_arch.vision_tower + model_arch.aligner)
+
+
+def _is_vit_or_aligner_full_parameter_name(model_arch, name: str) -> bool:
+    return (_is_vit_or_aligner_parameter_name(model_arch, name)
+            and not _is_adapter_parameter_name(name))
 
 
 def _get_active_tasks(aux_config: Dict[str, object]) -> Sequence[str]:
@@ -446,6 +456,7 @@ class Qwen3VLAuxTuner(Tuner):
     def prepare_model(args: 'TrainArguments', model: torch.nn.Module) -> torch.nn.Module:
         model_arch = model.model_meta.model_arch
         from swift.llm.train.tuner import get_modules_to_save, get_target_modules
+        model.requires_grad_(False)
         target_modules = get_target_modules(args, model)
         modules_to_save = get_modules_to_save(args, model, 'CAUSAL_LM')
         lora_kwargs = {
@@ -468,9 +479,16 @@ class Qwen3VLAuxTuner(Tuner):
         model = attach_auxiliary_modules(model)
 
         train_vision = _is_true('QWEN3VL_AUX_TRAIN_VISION')
-        train_vit = train_vision or args.vit_lr is not None or not args.freeze_vit
-        train_aligner = (train_vision or _is_true('QWEN3VL_AUX_TRAIN_ALIGNER') or args.aligner_lr is not None
-                         or not args.freeze_aligner)
+        train_vit = train_vision
+        train_aligner = train_vision or _is_true('QWEN3VL_AUX_TRAIN_ALIGNER')
+        if args.vit_lr is not None and args.freeze_vit and not train_vit:
+            logger.warning(
+                'vit_lr is set but freeze_vit=True, so no vision-tower LoRA/full parameters are trainable. '
+                'Pass --freeze_vit false for ViT LoRA, or QWEN3VL_AUX_TRAIN_VISION=1 for full ViT training.')
+        if args.aligner_lr is not None and args.freeze_aligner and not train_aligner:
+            logger.warning(
+                'aligner_lr is set but freeze_aligner=True, so no aligner LoRA/full parameters are trainable. '
+                'Pass --freeze_aligner false for aligner LoRA, or QWEN3VL_AUX_TRAIN_ALIGNER=1 for full aligner training.')
         if train_vit:
             for module_prefix in model_arch.vision_tower:
                 deep_getattr(model, module_prefix).requires_grad_(True)
@@ -511,11 +529,13 @@ class Qwen3VLAuxTuner(Tuner):
         vit_state_dict = {
             name: value
             for name, value in state_dict.items()
-            if name in trainable_parameter_names and _is_vit_or_aligner_parameter_name(model_arch, name)
+            if name in trainable_parameter_names and _is_vit_or_aligner_full_parameter_name(model_arch, name)
         }
+        vit_weights_path = os.path.join(save_directory, AUX_VIT_TRAINABLES)
         if vit_state_dict:
-            safetensors.torch.save_file(
-                vit_state_dict, os.path.join(save_directory, AUX_VIT_TRAINABLES), metadata={'format': 'pt'})
+            safetensors.torch.save_file(vit_state_dict, vit_weights_path, metadata={'format': 'pt'})
+        elif os.path.exists(vit_weights_path):
+            os.remove(vit_weights_path)
 
     @staticmethod
     def from_pretrained(model: torch.nn.Module, model_id: str, **kwargs) -> torch.nn.Module:

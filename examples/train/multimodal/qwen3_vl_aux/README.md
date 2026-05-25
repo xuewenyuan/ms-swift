@@ -123,7 +123,7 @@ L = λ_lm * L_lm
 - `QWEN3VL_AUX_HEAD_LR`
   - 默认辅助分支学习率
 - `--vit_lr` / `--aligner_lr`
-  - 传入后会解冻 ViT / aligner 做全参训练，并分别进入独立 optimizer group
+  - 给 ViT / aligner 参数组设置独立学习率；`--freeze_vit false` / `--freeze_aligner false` 会让对应模块进入 LoRA target，`QWEN3VL_AUX_TRAIN_VISION=1` / `QWEN3VL_AUX_TRAIN_ALIGNER=1` 才会强制全参训练
 - `QWEN3VL_AUX_LOAD_HEADS`
   - 加载 aux checkpoint 时是否加载 aux head。训练恢复默认 `true`，export/merge 默认 `false`
 - `QWEN3VL_AUX_CONFIG_PATH`
