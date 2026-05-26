@@ -1,9 +1,35 @@
 # Copyright (c) Alibaba, Inc. and its affiliates.
 import re
+from contextlib import contextmanager
 from typing import Dict, List, Optional, Set, Tuple
 
 from swift.plugin.metric import metric_mapping
 from swift.utils import Serializer
+
+
+def _patch_generate_context_remove_unused_columns() -> None:
+    from swift.llm.template.base import Template
+
+    if getattr(Template, '_lateral_decision_generate_context_patched', False):
+        return
+
+    origin_generate_context = Template.generate_context
+
+    @contextmanager
+    def generate_context(self):
+        remove_unused_columns = self.remove_unused_columns
+        with origin_generate_context(self):
+            self.remove_unused_columns = True
+            try:
+                yield
+            finally:
+                self.remove_unused_columns = remove_unused_columns
+
+    Template.generate_context = generate_context
+    Template._lateral_decision_generate_context_patched = True
+
+
+_patch_generate_context_remove_unused_columns()
 
 
 LATERAL_DECISION_NAME_TO_TOKEN = {
