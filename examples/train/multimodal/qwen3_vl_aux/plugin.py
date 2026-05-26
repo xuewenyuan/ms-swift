@@ -220,6 +220,23 @@ def _pop_label_path_inputs(kwargs: Dict[str, object], preferred_key: str) -> Dic
     return label_inputs
 
 
+def _has_aux_label_value(value: object) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return bool(value)
+    if isinstance(value, Mapping):
+        return any(_has_aux_label_value(item) for item in value.values())
+    if isinstance(value, (list, tuple, set)):
+        return any(_has_aux_label_value(item) for item in value)
+    return True
+
+
+def _has_aux_label_inputs(batch_kwargs: Mapping[str, object], raw_targets: Mapping[str, object]) -> bool:
+    return any(_has_aux_label_value(value) for value in batch_kwargs.values()) or any(
+        _has_aux_label_value(value) for value in raw_targets.values())
+
+
 def _attach_task_modules(target_model: nn.Module, aux_config: Dict[str, object]) -> None:
     target_model.aux_label_loader = Qwen3VLAuxLabelLoader(aux_config)
     target_model.aux_heads = AuxSeparateHeads(aux_config)
@@ -250,8 +267,12 @@ def attach_auxiliary_modules(model: nn.Module, aux_config: Optional[Dict[str, ob
             label_key = self.aux_head_config['tasks'][task]['label_key']
             if label_key not in {'y_bev', 'y_cog', 'y_god'} and label_key in kwargs:
                 extra_task_targets[task] = kwargs.pop(label_key)
+        raw_targets = {'bev': y_bev, 'cog': y_cog, 'god': y_god}
+        raw_targets.update(extra_task_targets)
+        has_aux_labels = _has_aux_label_inputs(extra_label_inputs, raw_targets)
+        run_aux = bool(active_tasks) and (has_aux_labels or self.training)
         kwargs.setdefault('return_dict', True)
-        if active_tasks:
+        if run_aux:
             kwargs['output_hidden_states'] = True
         input_ids = kwargs.get('input_ids')
         if input_ids is None and args:
@@ -269,7 +290,7 @@ def attach_auxiliary_modules(model: nn.Module, aux_config: Optional[Dict[str, ob
         set_value(outputs, 'aux_loss_weights', {})
         set_aux_state(self, aux_state)
 
-        if not active_tasks:
+        if not run_aux:
             return outputs
         if input_ids is None:
             return outputs
@@ -291,8 +312,6 @@ def attach_auxiliary_modules(model: nn.Module, aux_config: Optional[Dict[str, ob
         set_value(outputs, 'aux_enabled_tasks', list(active_tasks))
         set_value(outputs, 'aux_loss_weights', task_weights)
         set_aux_state(self, aux_state)
-        raw_targets = {'bev': y_bev, 'cog': y_cog, 'god': y_god}
-        raw_targets.update(extra_task_targets)
         aux_labels = self.aux_label_loader(
             batch_size=input_ids.shape[0],
             batch_kwargs=extra_label_inputs,
@@ -330,11 +349,18 @@ def attach_auxiliary_modules(model: nn.Module, aux_config: Optional[Dict[str, ob
             aux_predictions[task] = prediction
             set_value(outputs, f'{task}_prediction', prediction)
 
+            target = aux_labels['task_targets'].get(task)
+            if target is None:
+                aux_state['task_losses'][task] = None
+                set_value(outputs, f'{task}_aux_loss', None)
+                set_aux_state(self, aux_state)
+                continue
+
             try:
                 loss_output = self.aux_losses(
                     task,
                     predictions=prediction,
-                    targets=aux_labels['task_targets'][task],
+                    targets=target,
                     aux_labels=aux_labels,
                     aux_features=aux_features,
                     model_outputs=outputs,
