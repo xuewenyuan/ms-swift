@@ -21,6 +21,23 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional
 
 
+LATERAL_DECISION_TOKENS = {
+    'LAT_LANE_CHANGE_LEFT',
+    'LAT_LANE_CHANGE_RIGHT',
+    'LAT_NUDGE_LEFT',
+    'LAT_NUDGE_RIGHT',
+    'LAT_LANE_KEEP',
+    'LAT_INTERSECTION_FOLLOW',
+    'LAT_TURN_LEFT',
+    'LAT_TURN_RIGHT',
+    'LAT_U_TURN',
+}
+LONGITUDINAL_DECISION_TOKENS = {
+    'LON_MAINTAIN',
+    'LON_ACCELERATE',
+    'LON_DECELERATE',
+    'LON_STOP',
+}
 EVAL_SET_MARKER_KEY = '__EVAL_SET__'
 EVAL_GROUP_MARKER_KEY = '__EVAL_GROUP__'
 MARKER_RE_TEMPLATE = r'(?:^|\n)\s*{key}\s*=\s*[^\r\n]*(?:\r?\n)?'
@@ -67,8 +84,34 @@ def _add_marker(content: str, marker_value: str, marker_key: str, replace_existi
     return f'{marker}\n{content}' if content else marker
 
 
+def _sanitize_metric_component(value: str) -> str:
+    value = value.strip()
+    value = ''.join(ch if ch.isalnum() or ch == '_' else '_' for ch in value)
+    value = re.sub(r'_+', '_', value).strip('_')
+    return value.lower() or 'unknown'
+
+
+def _extract_tokens(content: str) -> List[str]:
+    return [token.strip() for token in re.findall(r'<([^<>]+)>', content or '')]
+
+
+def _extract_decision_group_from_content(content: str) -> str:
+    lateral_decision = None
+    longitudinal_decision = None
+    for token in _extract_tokens(content):
+        token = token.strip().strip('<>').strip()
+        if lateral_decision is None and token in LATERAL_DECISION_TOKENS:
+            lateral_decision = token
+        if longitudinal_decision is None and token in LONGITUDINAL_DECISION_TOKENS:
+            longitudinal_decision = token
+        if lateral_decision is not None and longitudinal_decision is not None:
+            return _sanitize_metric_component(f'{lateral_decision}_and_{longitudinal_decision}')
+    raise ValueError(f'Cannot derive eval group from assistant content: {content!r}')
+
+
 def add_eval_set_marker(row: Dict, eval_set: str, *, assistant_mode: str, marker_key: str,
-                        replace_existing: bool, eval_group: Optional[str], group_marker_key: str) -> Dict:
+                        replace_existing: bool, eval_group: Optional[str], eval_group_from_decision: bool,
+                        group_marker_key: str) -> Dict:
     messages = row.get('messages')
     if not isinstance(messages, list):
         raise ValueError('Each row must contain a list field named "messages".')
@@ -78,8 +121,11 @@ def add_eval_set_marker(row: Dict, eval_set: str, *, assistant_mode: str, marker
     for index in indices:
         message = messages[index]
         content = message.get('content', '')
-        if eval_group:
-            content = _add_marker(content, eval_group, group_marker_key, replace_existing=replace_existing)
+        current_eval_group = eval_group
+        if eval_group_from_decision:
+            current_eval_group = _extract_decision_group_from_content(content)
+        if current_eval_group:
+            content = _add_marker(content, current_eval_group, group_marker_key, replace_existing=replace_existing)
         message['content'] = _add_marker(content, eval_set, marker_key, replace_existing=replace_existing)
     return row
 
@@ -91,7 +137,8 @@ def _resolve_eval_set(input_path: Path, explicit_eval_set: Optional[str]) -> str
 
 
 def process_file(input_path: Path, output_path: Path, *, eval_set: str, assistant_mode: str, marker_key: str,
-                 replace_existing: bool, eval_group: Optional[str], group_marker_key: str) -> int:
+                 replace_existing: bool, eval_group: Optional[str], eval_group_from_decision: bool,
+                 group_marker_key: str) -> int:
     count = 0
     in_place = input_path.resolve() == output_path.resolve()
     if in_place:
@@ -114,6 +161,7 @@ def process_file(input_path: Path, output_path: Path, *, eval_set: str, assistan
                     marker_key=marker_key,
                     replace_existing=replace_existing,
                     eval_group=eval_group,
+                    eval_group_from_decision=eval_group_from_decision,
                     group_marker_key=group_marker_key)
                 f.write(json.dumps(row, ensure_ascii=False, separators=(',', ':')) + '\n')
                 count += 1
@@ -136,6 +184,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         '--eval-group',
         help='Optional eval-group name to write. If omitted, no eval-group marker is added.')
+    parser.add_argument(
+        '--eval-group-from-decision',
+        action='store_true',
+        help='Derive eval-group per sample from the assistant decision tokens.')
     parser.add_argument('--output', type=Path, help='Output jsonl path. Only valid for one input.')
     parser.add_argument('--output-dir', type=Path, help='Directory for output files when processing multiple inputs.')
     parser.add_argument(
@@ -167,6 +219,8 @@ def main() -> None:
         raise ValueError('--output and --output-dir cannot be used together.')
     if args.in_place and (args.output or args.output_dir):
         raise ValueError('--in-place cannot be combined with --output or --output-dir.')
+    if args.eval_group and args.eval_group_from_decision:
+        raise ValueError('--eval-group and --eval-group-from-decision cannot be used together.')
 
     for input_path in args.inputs:
         input_path = input_path.expanduser()
@@ -188,8 +242,13 @@ def main() -> None:
             marker_key=args.marker_key,
             replace_existing=args.replace_existing,
             eval_group=args.eval_group,
+            eval_group_from_decision=args.eval_group_from_decision,
             group_marker_key=args.group_marker_key)
-        eval_group_msg = f'  eval_group={args.eval_group}' if args.eval_group else ''
+        eval_group_msg = ''
+        if args.eval_group:
+            eval_group_msg = f'  eval_group={args.eval_group}'
+        elif args.eval_group_from_decision:
+            eval_group_msg = '  eval_group=from_decision'
         print(f'{input_path} -> {output_path}  eval_set={eval_set}{eval_group_msg}  rows={count}')
 
 
