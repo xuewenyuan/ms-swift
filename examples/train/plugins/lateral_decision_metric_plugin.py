@@ -71,6 +71,10 @@ LONGITUDINAL_DECISION_TOKENS = [
     'LON_STOP',
 ]
 
+EVAL_SET_MARKER_RE = re.compile(r'(?:^|\n)\s*__EVAL_SET__\s*=\s*([^\r\n]+)')
+EVAL_GROUP_MARKER_RE = re.compile(r'(?:^|\n)\s*__EVAL_GROUP__\s*=\s*([^\r\n]+)')
+UNKNOWN_EVAL_SET_NAME = 'unknown'
+
 
 def _decode_serialized_text(row) -> str:
     try:
@@ -101,6 +105,27 @@ def _extract_tokens(text: str) -> List[str]:
     return [token.strip() for token in re.findall(r'<([^<>]+)>', text or '')]
 
 
+def _sanitize_metric_component(value: str) -> str:
+    value = value.strip()
+    value = ''.join(ch if ch.isalnum() or ch == '_' else '_' for ch in value)
+    value = re.sub(r'_+', '_', value).strip('_')
+    return value.lower() or UNKNOWN_EVAL_SET_NAME
+
+
+def extract_eval_set_from_labels(labels: str) -> Optional[str]:
+    match = EVAL_SET_MARKER_RE.search(labels or '')
+    if match is None:
+        return None
+    return _sanitize_metric_component(match.group(1))
+
+
+def extract_eval_group_from_labels(labels: str) -> Optional[str]:
+    match = EVAL_GROUP_MARKER_RE.search(labels or '')
+    if match is None:
+        return None
+    return _sanitize_metric_component(match.group(1))
+
+
 def extract_decisions_from_response(response: str) -> Tuple[Optional[str], Optional[str]]:
     if '</think>' in response:
         response = response.split('</think>', 1)[1]
@@ -117,22 +142,29 @@ def extract_decisions_from_response(response: str) -> Tuple[Optional[str], Optio
     return lateral_decision, longitudinal_decision
 
 
-def extract_decision_gt_from_labels(labels: str) -> Tuple[Set[str], Set[str]]:
+def _extract_answer_content(labels: str) -> str:
     answer_match = re.search(r'<answer>(.*?)</answer>', labels or '', re.DOTALL)
-    answer_content = answer_match.group(1) if answer_match else labels
+    return answer_match.group(1) if answer_match else labels
 
-    lateral_gt_set = set()
-    longitudinal_gt_set = set()
+
+def extract_decision_gt_pairs_from_labels(labels: str) -> Set[Tuple[Optional[str], Optional[str]]]:
+    answer_content = _extract_answer_content(labels)
+    gt_pairs = set()
     for result in answer_content.split(';'):
         tokens = _extract_tokens(result)
         if not tokens:
             continue
         lateral = _normalize_lateral_decision(tokens[0])
-        if lateral is not None:
-            lateral_gt_set.add(lateral)
         longitudinal = _normalize_longitudinal_decision(tokens[1] if len(tokens) >= 2 else None)
-        if longitudinal is not None:
-            longitudinal_gt_set.add(longitudinal)
+        if lateral is not None or longitudinal is not None:
+            gt_pairs.add((lateral, longitudinal))
+    return gt_pairs
+
+
+def extract_decision_gt_from_labels(labels: str) -> Tuple[Set[str], Set[str]]:
+    gt_pairs = extract_decision_gt_pairs_from_labels(labels)
+    lateral_gt_set = {lateral for lateral, _ in gt_pairs if lateral is not None}
+    longitudinal_gt_set = {longitudinal for _, longitudinal in gt_pairs if longitudinal is not None}
     return lateral_gt_set, longitudinal_gt_set
 
 
@@ -165,6 +197,49 @@ def _add_class_metrics(metrics: Dict[str, float], class_counts: Dict[str, Dict[s
         metrics[f'{prefix}_f1'] = f1
 
 
+def _init_decision_stats(tokens: List[str]) -> Dict:
+    return {
+        'class_counts': _init_class_counts(tokens),
+        'correct': 0,
+        'total': 0,
+    }
+
+
+def _update_decision_stats(stats: Dict, pred: Optional[str], gt_set: Set[str]) -> None:
+    stats['total'] += 1
+    stats['correct'] += int(pred in gt_set)
+    _update_class_counts(pred, gt_set, stats['class_counts'])
+
+
+def _add_decision_stats_metrics(metrics: Dict[str, float], stats: Dict, metric_prefix: str, *, full: bool) -> None:
+    metrics[f'{metric_prefix}_frame_acc'] = _safe_div(stats['correct'], stats['total'])
+    if full:
+        _add_class_metrics(metrics, stats['class_counts'])
+
+
+def _add_prefixed_class_metrics(metrics: Dict[str, float], class_counts: Dict[str, Dict[str, int]],
+                                prefix: str) -> None:
+    class_metrics = {}
+    _add_class_metrics(class_metrics, class_counts)
+    for key, value in class_metrics.items():
+        metrics[f'{prefix}_{key}'] = value
+
+
+def _add_group_decision_stats_metrics(metrics: Dict[str, float], stats: Dict, metric_prefix: str, eval_set: str,
+                                      *, full: bool) -> None:
+    prefix = f'{metric_prefix}_{eval_set}'
+    metrics[f'{prefix}_frame_acc'] = _safe_div(stats['correct'], stats['total'])
+    if full:
+        _add_prefixed_class_metrics(metrics, stats['class_counts'], prefix)
+
+
+def _update_stats_by_key(stats_by_key: Dict[str, Dict], key: str, tokens: List[str], pred: Optional[str],
+                         gt_set: Set[str]) -> None:
+    if key not in stats_by_key:
+        stats_by_key[key] = _init_decision_stats(tokens)
+    _update_decision_stats(stats_by_key[key], pred, gt_set)
+
+
 def _compute_decision_metrics(prediction, *, dimension: str, full: bool) -> Dict[str, float]:
     preds, labels = prediction[0], prediction[1]
     if dimension == 'lateral':
@@ -176,13 +251,20 @@ def _compute_decision_metrics(prediction, *, dimension: str, full: bool) -> Dict
     else:
         raise ValueError(f'Unsupported decision dimension: {dimension}')
 
-    class_counts = _init_class_counts(tokens)
-    total = 0
-    correct = 0
+    overall_stats = _init_decision_stats(tokens)
+    eval_set_stats: Dict[str, Dict] = {}
+    eval_group_stats: Dict[str, Dict] = {}
+    eval_set_group_stats: Dict[str, Dict] = {}
+    has_eval_set_marker = False
+    has_eval_group = False
 
     for i in range(preds.shape[0]):
         pred_text = _decode_serialized_text(preds[i])
         label_text = _decode_serialized_text(labels[i])
+        eval_set = extract_eval_set_from_labels(label_text)
+        eval_group = extract_eval_group_from_labels(label_text)
+        has_eval_set_marker = has_eval_set_marker or eval_set is not None
+        has_eval_group = has_eval_group or eval_group is not None
 
         pred_lateral, pred_longitudinal = extract_decisions_from_response(pred_text)
         gt_lateral_set, gt_longitudinal_set = extract_decision_gt_from_labels(label_text)
@@ -196,14 +278,25 @@ def _compute_decision_metrics(prediction, *, dimension: str, full: bool) -> Dict
         if not gt_set:
             continue
 
-        total += 1
-        correct += int(pred_decision in gt_set)
-        if full:
-            _update_class_counts(pred_decision, gt_set, class_counts)
+        _update_decision_stats(overall_stats, pred_decision, gt_set)
+        eval_set = eval_set or UNKNOWN_EVAL_SET_NAME
+        _update_stats_by_key(eval_set_stats, eval_set, tokens, pred_decision, gt_set)
+        if eval_group is not None:
+            _update_stats_by_key(eval_group_stats, f'group_{eval_group}', tokens, pred_decision, gt_set)
+            _update_stats_by_key(eval_set_group_stats, f'{eval_set}_group_{eval_group}', tokens, pred_decision,
+                                 gt_set)
 
-    metrics = {f'{metric_prefix}_frame_acc': _safe_div(correct, total)}
-    if full:
-        _add_class_metrics(metrics, class_counts)
+    metrics = {}
+    _add_decision_stats_metrics(metrics, overall_stats, metric_prefix, full=full)
+    if has_eval_set_marker:
+        for eval_set, stats in sorted(eval_set_stats.items()):
+            _add_group_decision_stats_metrics(metrics, stats, metric_prefix, eval_set, full=full)
+    if has_eval_group:
+        for eval_group, stats in sorted(eval_group_stats.items()):
+            _add_group_decision_stats_metrics(metrics, stats, metric_prefix, eval_group, full=full)
+        if has_eval_set_marker:
+            for eval_set_group, stats in sorted(eval_set_group_stats.items()):
+                _add_group_decision_stats_metrics(metrics, stats, metric_prefix, eval_set_group, full=full)
     return metrics
 
 
