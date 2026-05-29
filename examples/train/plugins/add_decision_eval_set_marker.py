@@ -21,6 +21,18 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional
 
 
+LATERAL_DECISION_NAME_TO_TOKEN = {
+    '左换道': 'LAT_LANE_CHANGE_LEFT',
+    '右换道': 'LAT_LANE_CHANGE_RIGHT',
+    '左避让': 'LAT_NUDGE_LEFT',
+    '右避让': 'LAT_NUDGE_RIGHT',
+    '车道居中': 'LAT_LANE_KEEP',
+    '车道内居中': 'LAT_LANE_KEEP',
+    '路口顺行': 'LAT_INTERSECTION_FOLLOW',
+    '路口左转': 'LAT_TURN_LEFT',
+    '路口右转': 'LAT_TURN_RIGHT',
+    '路口掉头': 'LAT_U_TURN',
+}
 LATERAL_DECISION_TOKENS = {
     'LAT_LANE_CHANGE_LEFT',
     'LAT_LANE_CHANGE_RIGHT',
@@ -31,6 +43,12 @@ LATERAL_DECISION_TOKENS = {
     'LAT_TURN_LEFT',
     'LAT_TURN_RIGHT',
     'LAT_U_TURN',
+}
+LONGITUDINAL_DECISION_NAME_TO_TOKEN = {
+    '保持': 'LON_MAINTAIN',
+    '加速': 'LON_ACCELERATE',
+    '减速': 'LON_DECELERATE',
+    '停车': 'LON_STOP',
 }
 LONGITUDINAL_DECISION_TOKENS = {
     'LON_MAINTAIN',
@@ -95,15 +113,28 @@ def _extract_tokens(content: str) -> List[str]:
     return [token.strip() for token in re.findall(r'<([^<>]+)>', content or '')]
 
 
+def _normalize_lateral_decision(value: str) -> Optional[str]:
+    value = value.strip().strip('<>').strip()
+    if value in LATERAL_DECISION_TOKENS:
+        return value
+    return LATERAL_DECISION_NAME_TO_TOKEN.get(value)
+
+
+def _normalize_longitudinal_decision(value: str) -> Optional[str]:
+    value = value.strip().strip('<>').strip()
+    if value in LONGITUDINAL_DECISION_TOKENS:
+        return value
+    return LONGITUDINAL_DECISION_NAME_TO_TOKEN.get(value)
+
+
 def _extract_decision_group_from_content(content: str) -> str:
     lateral_decision = None
     longitudinal_decision = None
     for token in _extract_tokens(content):
-        token = token.strip().strip('<>').strip()
-        if lateral_decision is None and token in LATERAL_DECISION_TOKENS:
-            lateral_decision = token
-        if longitudinal_decision is None and token in LONGITUDINAL_DECISION_TOKENS:
-            longitudinal_decision = token
+        if lateral_decision is None:
+            lateral_decision = _normalize_lateral_decision(token)
+        if longitudinal_decision is None:
+            longitudinal_decision = _normalize_longitudinal_decision(token)
         if lateral_decision is not None and longitudinal_decision is not None:
             return _sanitize_metric_component(f'{lateral_decision}_and_{longitudinal_decision}')
     raise ValueError(f'Cannot derive eval group from assistant content: {content!r}')
@@ -187,7 +218,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         '--eval-group-from-decision',
         action='store_true',
-        help='Derive eval-group per sample from the assistant decision tokens.')
+        help='Derive eval-group per sample from assistant decision tokens or Chinese decision names.')
     parser.add_argument('--output', type=Path, help='Output jsonl path. Only valid for one input.')
     parser.add_argument('--output-dir', type=Path, help='Directory for output files when processing multiple inputs.')
     parser.add_argument(
