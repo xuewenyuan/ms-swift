@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # Copyright (c) Alibaba, Inc. and its affiliates.
-"""Add eval markers to assistant labels for decision metrics.
+"""Add or remove eval markers in assistant labels for decision metrics.
 
 The decision metric plugin recognizes marker lines like:
 
@@ -58,10 +58,12 @@ LONGITUDINAL_DECISION_TOKENS = {
 }
 EVAL_SET_MARKER_KEY = '__EVAL_SET__'
 EVAL_GROUP_MARKER_KEY = '__EVAL_GROUP__'
-MARKER_RE_TEMPLATE = r'(?:^|\n)\s*{key}\s*=\s*[^\r\n]*(?:\r?\n)?'
+MARKER_RE_TEMPLATE = r'^\s*{key}\s*=\s*[^\r\n]*(?:\r?\n)?'
 
 
-def _default_output_path(input_path: Path) -> Path:
+def _default_output_path(input_path: Path, *, remove_markers: bool) -> Path:
+    if remove_markers:
+        return input_path.with_name(f'{input_path.stem}.without_eval_markers{input_path.suffix or ".jsonl"}')
     return input_path.with_name(f'{input_path.stem}.with_eval_set{input_path.suffix or ".jsonl"}')
 
 
@@ -86,9 +88,13 @@ def _find_assistant_indices(messages: List[Dict], mode: str) -> List[int]:
     raise ValueError(f'Unsupported assistant mode: {mode}')
 
 
-def _strip_existing_marker(content: str, marker_key: str) -> str:
-    marker_re = re.compile(MARKER_RE_TEMPLATE.format(key=re.escape(marker_key)))
-    return marker_re.sub('', content, count=1)
+def _compile_marker_re(marker_key: str) -> re.Pattern:
+    return re.compile(MARKER_RE_TEMPLATE.format(key=re.escape(marker_key)), re.MULTILINE)
+
+
+def _strip_existing_marker(content: str, marker_key: str, *, count: int = 1) -> str:
+    marker_re = _compile_marker_re(marker_key)
+    return marker_re.sub('', content, count=count)
 
 
 def _add_marker(content: str, marker_value: str, marker_key: str, replace_existing: bool) -> str:
@@ -97,7 +103,7 @@ def _add_marker(content: str, marker_value: str, marker_key: str, replace_existi
     if replace_existing:
         content = _strip_existing_marker(content, marker_key)
     marker = f'{marker_key}={marker_value}'
-    if re.search(MARKER_RE_TEMPLATE.format(key=re.escape(marker_key)), content):
+    if _compile_marker_re(marker_key).search(content):
         return content
     return f'{marker}\n{content}' if content else marker
 
@@ -161,6 +167,23 @@ def add_eval_set_marker(row: Dict, eval_set: str, *, assistant_mode: str, marker
     return row
 
 
+def remove_eval_markers(row: Dict, *, assistant_mode: str, marker_key: str, group_marker_key: str) -> Dict:
+    messages = row.get('messages')
+    if not isinstance(messages, list):
+        raise ValueError('Each row must contain a list field named "messages".')
+    indices = _find_assistant_indices(messages, assistant_mode)
+    if not indices:
+        raise ValueError('No assistant message found in row.')
+    for index in indices:
+        message = messages[index]
+        content = message.get('content', '')
+        if not isinstance(content, str):
+            raise TypeError(f'Assistant content must be a string, got {type(content)!r}.')
+        content = _strip_existing_marker(content, marker_key, count=0)
+        message['content'] = _strip_existing_marker(content, group_marker_key, count=0)
+    return row
+
+
 def _resolve_eval_set(input_path: Path, explicit_eval_set: Optional[str]) -> str:
     if explicit_eval_set:
         return explicit_eval_set
@@ -169,7 +192,7 @@ def _resolve_eval_set(input_path: Path, explicit_eval_set: Optional[str]) -> str
 
 def process_file(input_path: Path, output_path: Path, *, eval_set: str, assistant_mode: str, marker_key: str,
                  replace_existing: bool, eval_group: Optional[str], eval_group_from_decision: bool,
-                 group_marker_key: str) -> int:
+                 group_marker_key: str, remove_markers: bool) -> int:
     count = 0
     in_place = input_path.resolve() == output_path.resolve()
     if in_place:
@@ -185,15 +208,19 @@ def process_file(input_path: Path, output_path: Path, *, eval_set: str, assistan
     try:
         with f:
             for row in _read_jsonl(input_path):
-                row = add_eval_set_marker(
-                    row,
-                    eval_set,
-                    assistant_mode=assistant_mode,
-                    marker_key=marker_key,
-                    replace_existing=replace_existing,
-                    eval_group=eval_group,
-                    eval_group_from_decision=eval_group_from_decision,
-                    group_marker_key=group_marker_key)
+                if remove_markers:
+                    row = remove_eval_markers(
+                        row, assistant_mode=assistant_mode, marker_key=marker_key, group_marker_key=group_marker_key)
+                else:
+                    row = add_eval_set_marker(
+                        row,
+                        eval_set,
+                        assistant_mode=assistant_mode,
+                        marker_key=marker_key,
+                        replace_existing=replace_existing,
+                        eval_group=eval_group,
+                        eval_group_from_decision=eval_group_from_decision,
+                        group_marker_key=group_marker_key)
                 f.write(json.dumps(row, ensure_ascii=False, separators=(',', ':')) + '\n')
                 count += 1
         if in_place:
@@ -207,7 +234,7 @@ def process_file(input_path: Path, output_path: Path, *, eval_set: str, assistan
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description='Add decision metric eval markers to assistant content in jsonl files.')
+        description='Add or remove decision metric eval markers in assistant content in jsonl files.')
     parser.add_argument('inputs', nargs='+', type=Path, help='Input jsonl file(s).')
     parser.add_argument(
         '--eval-set',
@@ -219,6 +246,10 @@ def parse_args() -> argparse.Namespace:
         '--eval-group-from-decision',
         action='store_true',
         help='Derive eval-group per sample from assistant decision tokens or Chinese decision names.')
+    parser.add_argument(
+        '--remove-markers',
+        action='store_true',
+        help='Remove eval-set and eval-group marker lines instead of adding markers.')
     parser.add_argument('--output', type=Path, help='Output jsonl path. Only valid for one input.')
     parser.add_argument('--output-dir', type=Path, help='Directory for output files when processing multiple inputs.')
     parser.add_argument(
@@ -252,6 +283,12 @@ def main() -> None:
         raise ValueError('--in-place cannot be combined with --output or --output-dir.')
     if args.eval_group and args.eval_group_from_decision:
         raise ValueError('--eval-group and --eval-group-from-decision cannot be used together.')
+    if args.remove_markers and args.eval_set:
+        raise ValueError('--remove-markers cannot be combined with --eval-set.')
+    if args.remove_markers and args.eval_group:
+        raise ValueError('--remove-markers cannot be combined with --eval-group.')
+    if args.remove_markers and args.eval_group_from_decision:
+        raise ValueError('--remove-markers cannot be combined with --eval-group-from-decision.')
 
     for input_path in args.inputs:
         input_path = input_path.expanduser()
@@ -262,9 +299,9 @@ def main() -> None:
         elif args.output_dir:
             output_path = args.output_dir.expanduser() / input_path.name
         else:
-            output_path = _default_output_path(input_path)
+            output_path = _default_output_path(input_path, remove_markers=args.remove_markers)
 
-        eval_set = _resolve_eval_set(input_path, args.eval_set)
+        eval_set = '' if args.remove_markers else _resolve_eval_set(input_path, args.eval_set)
         count = process_file(
             input_path,
             output_path,
@@ -274,13 +311,17 @@ def main() -> None:
             replace_existing=args.replace_existing,
             eval_group=args.eval_group,
             eval_group_from_decision=args.eval_group_from_decision,
-            group_marker_key=args.group_marker_key)
+            group_marker_key=args.group_marker_key,
+            remove_markers=args.remove_markers)
         eval_group_msg = ''
         if args.eval_group:
             eval_group_msg = f'  eval_group={args.eval_group}'
         elif args.eval_group_from_decision:
             eval_group_msg = '  eval_group=from_decision'
-        print(f'{input_path} -> {output_path}  eval_set={eval_set}{eval_group_msg}  rows={count}')
+        if args.remove_markers:
+            print(f'{input_path} -> {output_path}  mode=remove_markers  rows={count}')
+        else:
+            print(f'{input_path} -> {output_path}  eval_set={eval_set}{eval_group_msg}  rows={count}')
 
 
 if __name__ == '__main__':
