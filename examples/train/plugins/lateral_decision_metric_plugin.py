@@ -7,6 +7,14 @@ from swift.plugin.metric import metric_mapping
 from swift.utils import Serializer
 
 
+IGNORED_GENERATE_KWARGS = {
+    'scene_id',
+    'sample_token',
+    'timestamp',
+    'data_type_tag',
+}
+
+
 def _patch_generate_context_remove_unused_columns() -> None:
     from swift.llm.template.base import Template
 
@@ -29,7 +37,25 @@ def _patch_generate_context_remove_unused_columns() -> None:
     Template._lateral_decision_generate_context_patched = True
 
 
+def _patch_prepare_generate_kwargs() -> None:
+    from swift.llm.template.base import Template
+
+    if getattr(Template, '_lateral_decision_prepare_generate_kwargs_patched', False):
+        return
+
+    origin_prepare_generate_kwargs = Template.prepare_generate_kwargs
+
+    def prepare_generate_kwargs(self, generate_kwargs, *, model=None):
+        for key in IGNORED_GENERATE_KWARGS:
+            generate_kwargs.pop(key, None)
+        return origin_prepare_generate_kwargs(self, generate_kwargs, model=model)
+
+    Template.prepare_generate_kwargs = prepare_generate_kwargs
+    Template._lateral_decision_prepare_generate_kwargs_patched = True
+
+
 _patch_generate_context_remove_unused_columns()
+_patch_prepare_generate_kwargs()
 
 
 LATERAL_DECISION_NAME_TO_TOKEN = {
