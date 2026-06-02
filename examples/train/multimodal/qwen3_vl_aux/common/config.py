@@ -86,6 +86,18 @@ def get_aux_head_lr(default_lr: float) -> float:
     return float(os.environ.get('QWEN3VL_AUX_HEAD_LR', str(default_lr)))
 
 
+def apply_aux_env_overrides(config: Dict[str, Any]) -> Dict[str, Any]:
+    merged = _apply_env_overrides(copy.deepcopy(config))
+    enabled_tasks = merged.get('shared', {}).get('enabled_tasks')
+    if enabled_tasks is not None:
+        enabled_set = set(enabled_tasks)
+        for task in AUX_TASKS:
+            merged['tasks'][task]['enabled'] = task in enabled_set
+    merged['layer_indices'] = list(merged['shared']['layer_indices'])
+    merged['hidden_size'] = merged['shared']['hidden_size']
+    return merged
+
+
 def build_aux_config(target_model) -> Dict[str, Any]:
     text_config = getattr(target_model.config, 'text_config', target_model.config)
     hidden_size = getattr(text_config, 'hidden_size', None) or getattr(target_model.config, 'hidden_size')
@@ -241,12 +253,4 @@ def build_aux_config(target_model) -> Dict[str, Any]:
 
     user_config = _load_user_config()
     merged = _deep_update(copy.deepcopy(base_config), user_config)
-    merged = _apply_env_overrides(merged)
-    enabled_tasks = merged.get('shared', {}).get('enabled_tasks')
-    if enabled_tasks is not None:
-        enabled_set = set(enabled_tasks)
-        for task in AUX_TASKS:
-            merged['tasks'][task]['enabled'] = task in enabled_set
-    merged['layer_indices'] = list(merged['shared']['layer_indices'])
-    merged['hidden_size'] = merged['shared']['hidden_size']
-    return merged
+    return apply_aux_env_overrides(merged)

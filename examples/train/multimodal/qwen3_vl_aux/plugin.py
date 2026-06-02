@@ -16,7 +16,7 @@ if PLUGIN_DIR not in sys.path:
 
 from aux_heads import AuxSeparateHeads
 from aux_losses import AuxSeparateLosses
-from common.config import AUX_TASKS, build_aux_config, get_aux_head_lr
+from common.config import AUX_TASKS, apply_aux_env_overrides, build_aux_config, get_aux_head_lr
 from common.label_loader import Qwen3VLAuxLabelLoader
 from common.plugin_runtime import (AUX_STATE_ATTR, collect_task_losses_from_outputs, get_aux_state, get_target_model,
                                    get_value, make_aux_state, set_aux_state, set_value)
@@ -35,6 +35,7 @@ if TYPE_CHECKING:
 AUX_HEAD_CONFIG = 'aux_head_config.json'
 AUX_TRAINABLES = 'aux_trainables.safetensors'
 AUX_VIT_TRAINABLES = 'vit.safetensors'
+AUX_INIT_HEADS_FROM_ENV = 'QWEN3VL_AUX_INIT_HEADS_FROM'
 AUX_MODULE_KEYWORDS = ('aux_heads', 'aux_losses')
 ADAPTER_PARAMETER_KEYWORDS = ('lora_', 'modules_to_save')
 
@@ -52,6 +53,16 @@ def _parameter_in_prefixes(name: str, prefixes: Sequence[str]) -> bool:
 
 def _is_aux_parameter_name(name: str) -> bool:
     return any(keyword in name for keyword in AUX_MODULE_KEYWORDS)
+
+
+def _canonical_aux_parameter_name(name: str) -> Optional[str]:
+    for keyword in AUX_MODULE_KEYWORDS:
+        if name == keyword or name.startswith(f'{keyword}.'):
+            return name
+        marker = f'.{keyword}.'
+        if marker in name:
+            return f'{keyword}.{name.split(marker, 1)[1]}'
+    return None
 
 
 def _is_adapter_parameter_name(name: str) -> bool:
@@ -235,6 +246,77 @@ def _has_aux_label_value(value: object) -> bool:
 def _has_aux_label_inputs(batch_kwargs: Mapping[str, object], raw_targets: Mapping[str, object]) -> bool:
     return any(_has_aux_label_value(value) for value in batch_kwargs.values()) or any(
         _has_aux_label_value(value) for value in raw_targets.values())
+
+
+def _get_aux_init_dir() -> Optional[str]:
+    aux_init_dir = os.environ.get(AUX_INIT_HEADS_FROM_ENV)
+    if not aux_init_dir:
+        return None
+    aux_init_dir = os.path.expanduser(aux_init_dir)
+    if not os.path.isdir(aux_init_dir):
+        raise FileNotFoundError(f'{AUX_INIT_HEADS_FROM_ENV} directory does not exist: {aux_init_dir}')
+    return aux_init_dir
+
+
+def _load_aux_config(model_id: str, *, required: bool = False) -> Optional[Dict[str, object]]:
+    aux_config_path = os.path.join(model_id, AUX_HEAD_CONFIG)
+    if not os.path.exists(aux_config_path):
+        if required:
+            raise FileNotFoundError(f'Missing auxiliary head config: {aux_config_path}')
+        return None
+    with open(aux_config_path, 'r', encoding='utf-8') as f:
+        return apply_aux_env_overrides(json.load(f))
+
+
+def _load_aux_trainables(model: nn.Module, model_id: str, *, required: bool = False) -> None:
+    aux_weights_path = os.path.join(model_id, AUX_TRAINABLES)
+    if not os.path.exists(aux_weights_path):
+        if required:
+            raise FileNotFoundError(f'Missing auxiliary trainables: {aux_weights_path}')
+        return
+    state_dict = safetensors.torch.load_file(aux_weights_path)
+    canonical_state_dict = {}
+    for name, value in state_dict.items():
+        canonical_name = _canonical_aux_parameter_name(name)
+        if canonical_name is None:
+            logger.warning(f'Ignoring non-auxiliary key in {aux_weights_path}: {name}')
+            continue
+        canonical_state_dict[canonical_name] = value
+    target_model = get_target_model(model)
+    missing, unexpected = target_model.load_state_dict(canonical_state_dict, strict=False)
+    missing_aux = [name for name in missing if _is_aux_parameter_name(name)]
+    logger.info(f'Loaded auxiliary trainables from {aux_weights_path}.')
+    if missing_aux:
+        logger.warning(f'Missing auxiliary keys when loading trainables: {missing_aux}')
+    if unexpected:
+        logger.warning(f'Unexpected keys when loading auxiliary trainables: {unexpected}')
+
+
+def _load_vit_trainables(model: nn.Module, model_id: str) -> None:
+    vit_weights_path = os.path.join(model_id, AUX_VIT_TRAINABLES)
+    if not os.path.exists(vit_weights_path):
+        return
+    state_dict = safetensors.torch.load_file(vit_weights_path)
+    _, unexpected = model.load_state_dict(state_dict, strict=False)
+    logger.info(f'Loaded ViT/aligner trainables from {vit_weights_path}.')
+    if unexpected:
+        logger.warning(f'Unexpected keys when loading ViT/aligner trainables: {unexpected}')
+
+
+def _enable_full_backbone_training(model: nn.Module) -> tuple[bool, bool]:
+    model_arch = model.model_meta.model_arch
+    train_vision = _is_true('QWEN3VL_AUX_TRAIN_VISION')
+    train_vit = train_vision
+    train_aligner = train_vision or _is_true('QWEN3VL_AUX_TRAIN_ALIGNER')
+    if train_vit:
+        for module_prefix in model_arch.vision_tower:
+            deep_getattr(model, module_prefix).requires_grad_(True)
+        logger.info('Enabled full-parameter training for vision tower.')
+    if train_aligner:
+        for module_prefix in model_arch.aligner:
+            deep_getattr(model, module_prefix).requires_grad_(True)
+        logger.info('Enabled full-parameter training for aligner.')
+    return train_vit, train_aligner
 
 
 def _attach_task_modules(target_model: nn.Module, aux_config: Dict[str, object]) -> None:
@@ -480,49 +562,57 @@ class Qwen3VLAuxTuner(Tuner):
 
     @staticmethod
     def prepare_model(args: 'TrainArguments', model: torch.nn.Module) -> torch.nn.Module:
-        model_arch = model.model_meta.model_arch
         from swift.llm.train.tuner import get_modules_to_save, get_target_modules
         model.requires_grad_(False)
-        target_modules = get_target_modules(args, model)
-        modules_to_save = get_modules_to_save(args, model, 'CAUSAL_LM')
-        lora_kwargs = {
-            'r': args.lora_rank,
-            'target_modules': target_modules,
-            'lora_alpha': args.lora_alpha,
-            'lora_dropout': args.lora_dropout,
-            'bias': args.lora_bias,
-            'modules_to_save': modules_to_save,
-            'use_rslora': args.use_rslora,
-            'use_dora': args.use_dora,
-            'lorap_lr_ratio': args.lorap_lr_ratio,
-            'init_lora_weights': args.init_weights,
-        }
-        if args.target_parameters is not None:
-            lora_kwargs['target_parameters'] = args.target_parameters
-        lora_config = LoraConfig(task_type='CAUSAL_LM', lora_dtype=args.lora_dtype, **lora_kwargs)
-        logger.info(f'lora_config: {lora_config}')
-        model = Swift.prepare_model(model, lora_config)
-        model = attach_auxiliary_modules(model)
+        disable_lora = _is_true('QWEN3VL_AUX_DISABLE_LORA')
+        if disable_lora:
+            logger.info('QWEN3VL_AUX_DISABLE_LORA=1: skipped LoRA injection.')
+        else:
+            target_modules = get_target_modules(args, model)
+            modules_to_save = get_modules_to_save(args, model, 'CAUSAL_LM')
+            lora_kwargs = {
+                'r': args.lora_rank,
+                'target_modules': target_modules,
+                'lora_alpha': args.lora_alpha,
+                'lora_dropout': args.lora_dropout,
+                'bias': args.lora_bias,
+                'modules_to_save': modules_to_save,
+                'use_rslora': args.use_rslora,
+                'use_dora': args.use_dora,
+                'lorap_lr_ratio': args.lorap_lr_ratio,
+                'init_lora_weights': args.init_weights,
+            }
+            if args.target_parameters is not None:
+                lora_kwargs['target_parameters'] = args.target_parameters
+            lora_config = LoraConfig(task_type='CAUSAL_LM', lora_dtype=args.lora_dtype, **lora_kwargs)
+            logger.info(f'lora_config: {lora_config}')
+            model = Swift.prepare_model(model, lora_config)
 
-        train_vision = _is_true('QWEN3VL_AUX_TRAIN_VISION')
-        train_vit = train_vision
-        train_aligner = train_vision or _is_true('QWEN3VL_AUX_TRAIN_ALIGNER')
-        if args.vit_lr is not None and args.freeze_vit and not train_vit:
+        aux_init_dir = _get_aux_init_dir()
+        aux_config = _load_aux_config(aux_init_dir, required=True) if aux_init_dir else None
+        model = attach_auxiliary_modules(model, aux_config=aux_config)
+        target_model = get_target_model(model)
+        target_model._qwen3vl_aux_disable_lora = disable_lora
+        if aux_init_dir:
+            _load_aux_trainables(model, aux_init_dir, required=True)
+
+        train_vit, train_aligner = _enable_full_backbone_training(model)
+        if disable_lora and args.vit_lr is not None and not train_vit:
+            logger.warning(
+                'vit_lr is set but LoRA is disabled and full vision training is not enabled, '
+                'so no vision-tower parameters are trainable. Pass QWEN3VL_AUX_TRAIN_VISION=1 to train full ViT.')
+        elif args.vit_lr is not None and args.freeze_vit and not train_vit:
             logger.warning(
                 'vit_lr is set but freeze_vit=True, so no vision-tower LoRA/full parameters are trainable. '
                 'Pass --freeze_vit false for ViT LoRA, or QWEN3VL_AUX_TRAIN_VISION=1 for full ViT training.')
-        if args.aligner_lr is not None and args.freeze_aligner and not train_aligner:
+        if disable_lora and args.aligner_lr is not None and not train_aligner:
+            logger.warning(
+                'aligner_lr is set but LoRA is disabled and full aligner training is not enabled, '
+                'so no aligner parameters are trainable. Pass QWEN3VL_AUX_TRAIN_ALIGNER=1 to train full aligner.')
+        elif args.aligner_lr is not None and args.freeze_aligner and not train_aligner:
             logger.warning(
                 'aligner_lr is set but freeze_aligner=True, so no aligner LoRA/full parameters are trainable. '
                 'Pass --freeze_aligner false for aligner LoRA, or QWEN3VL_AUX_TRAIN_ALIGNER=1 for full aligner training.')
-        if train_vit:
-            for module_prefix in model_arch.vision_tower:
-                deep_getattr(model, module_prefix).requires_grad_(True)
-            logger.info('Enabled full-parameter training for vision tower.')
-        if train_aligner:
-            for module_prefix in model_arch.aligner:
-                deep_getattr(model, module_prefix).requires_grad_(True)
-            logger.info('Enabled full-parameter training for aligner.')
         return model
 
     @staticmethod
@@ -536,9 +626,14 @@ class Qwen3VLAuxTuner(Tuner):
         trainable_parameter_names = {name for name, param in model.named_parameters() if param.requires_grad}
         if state_dict is None:
             state_dict = {n: p.detach().cpu() for n, p in model.named_parameters() if p.requires_grad}
-        model.save_pretrained(save_directory, state_dict=state_dict, safe_serialization=safe_serialization, **kwargs)
 
         target_model = get_target_model(model)
+        disable_lora = getattr(target_model, '_qwen3vl_aux_disable_lora', False)
+        if disable_lora:
+            logger.info('Saving auxiliary-only checkpoint without adapter files because LoRA is disabled.')
+        else:
+            model.save_pretrained(save_directory, state_dict=state_dict, safe_serialization=safe_serialization, **kwargs)
+
         aux_config = getattr(target_model, 'aux_head_config', build_aux_config(target_model))
         with open(os.path.join(save_directory, AUX_HEAD_CONFIG), 'w', encoding='utf-8') as f:
             json.dump(aux_config, f, ensure_ascii=False, indent=2)
@@ -546,7 +641,9 @@ class Qwen3VLAuxTuner(Tuner):
         aux_state_dict = {}
         for name, value in state_dict.items():
             if name in trainable_parameter_names and _is_aux_parameter_name(name):
-                aux_state_dict[name] = value
+                canonical_name = _canonical_aux_parameter_name(name)
+                if canonical_name is not None:
+                    aux_state_dict[canonical_name] = value
         if aux_state_dict:
             safetensors.torch.save_file(
                 aux_state_dict, os.path.join(save_directory, AUX_TRAINABLES), metadata={'format': 'pt'})
@@ -567,35 +664,25 @@ class Qwen3VLAuxTuner(Tuner):
     def from_pretrained(model: torch.nn.Module, model_id: str, **kwargs) -> torch.nn.Module:
         is_trainable = bool(kwargs.get('is_trainable', False))
         load_aux_heads = _is_true('QWEN3VL_AUX_LOAD_HEADS', 'true' if is_trainable else 'false')
-        model = Swift.from_pretrained(model, model_id, **kwargs)
+        disable_lora = _is_true('QWEN3VL_AUX_DISABLE_LORA')
+        if disable_lora:
+            model.requires_grad_(False)
+            logger.info('QWEN3VL_AUX_DISABLE_LORA=1: loading auxiliary-only checkpoint without adapter files.')
+        else:
+            model = Swift.from_pretrained(model, model_id, **kwargs)
 
-        vit_weights_path = os.path.join(model_id, AUX_VIT_TRAINABLES)
-        if os.path.exists(vit_weights_path):
-            state_dict = safetensors.torch.load_file(vit_weights_path)
-            _, unexpected = model.load_state_dict(state_dict, strict=False)
-            logger.info(f'Loaded ViT/aligner trainables from {vit_weights_path}.')
-            if unexpected:
-                logger.warning(f'Unexpected keys when loading ViT/aligner trainables: {unexpected}')
+        _load_vit_trainables(model, model_id)
 
         if not load_aux_heads:
             return model
 
-        aux_config_path = os.path.join(model_id, AUX_HEAD_CONFIG)
-        aux_config = None
-        if os.path.exists(aux_config_path):
-            with open(aux_config_path, 'r', encoding='utf-8') as f:
-                aux_config = json.load(f)
+        aux_config = _load_aux_config(model_id)
         model = attach_auxiliary_modules(model, aux_config=aux_config)
-
-        aux_weights_path = os.path.join(model_id, AUX_TRAINABLES)
-        if os.path.exists(aux_weights_path):
-            state_dict = safetensors.torch.load_file(aux_weights_path)
-            missing, unexpected = model.load_state_dict(state_dict, strict=False)
-            logger.info(f'Loaded auxiliary trainables from {aux_weights_path}.')
-            if missing:
-                logger.warning(f'Missing keys when loading aux trainables: {missing}')
-            if unexpected:
-                logger.warning(f'Unexpected keys when loading aux trainables: {unexpected}')
+        target_model = get_target_model(model)
+        target_model._qwen3vl_aux_disable_lora = disable_lora
+        _load_aux_trainables(model, model_id)
+        if is_trainable:
+            _enable_full_backbone_training(model)
         return model
 
 

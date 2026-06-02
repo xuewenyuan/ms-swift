@@ -21,7 +21,7 @@
   - 一次性调用 `AuxSeparateHeads`
   - 再按 task 拆分 `bev/god/cog` 的 loss
   - aux 训练默认关闭 LM 自回归 CE，只优化辅助 loss
-  - 保存 LoRA adapter、ViT/aligner 全参增量和 aux head；merge 给 LM 继续训练时默认不加载 aux head
+  - 保存 LoRA adapter、ViT/aligner 全参增量和 aux head；纯 Aux warmup 可关闭 LoRA，只保存 aux head
 - `common/`
   - `label_loader.py`
     - 负责把 `labels_path` 或 task-specific 路径懒加载成实际 label 对象
@@ -79,6 +79,20 @@ L = λ_lm * L_lm
 
 当 `average_tokens_across_devices=True` 时，SWIFT trainer 会在 custom loss 返回后再乘以进程数；插件会对返回给 trainer 的 loss 做反向补偿，日志里的 `loss` 应该与 `objective_loss` 同量级，`loss_scale_factor` 只用于确认这个补偿因子。
 
+推荐分两阶段训练：
+
+```bash
+# 阶段 1：只训练 Aux Head
+QWEN3VL_AUX_DISABLE_LORA=1 \
+QWEN3VL_AUX_LM_WEIGHT=0 \
+swift sft ...
+
+# 阶段 2：重新初始化 LoRA，并加载阶段 1 的 Aux Head
+QWEN3VL_AUX_INIT_HEADS_FROM=output/qwen3_vl_aux/checkpoint-100 \
+QWEN3VL_AUX_LM_WEIGHT=1 \
+swift sft ...
+```
+
 ## 推荐数据格式
 
 最直接的格式如下：
@@ -108,6 +122,10 @@ L = λ_lm * L_lm
   - 默认 `6,13,20,27`
 - `QWEN3VL_AUX_LM_WEIGHT`
   - 默认 `0`，表示训练辅助任务时关闭 LM 自回归监督
+- `QWEN3VL_AUX_DISABLE_LORA`
+  - 默认 `0`。设为 `1` 时不注入任何 LoRA，适合第一阶段只训练 Aux Head
+- `QWEN3VL_AUX_INIT_HEADS_FROM`
+  - 可选。指向第一阶段 checkpoint 目录，直接加载其中的 `aux_head_config.json` 和 `aux_trainables.safetensors`，适合第二阶段从 Aux Head warmup 结果开始联合训练
 - `QWEN3VL_AUX_DPT_PATCH_SIZE`
   - 默认 `32`，按 Qwen3-VL merged visual token 的有效 patch stride 来设
 - `QWEN3VL_AUX_DPT_FEATURES`
@@ -206,10 +224,13 @@ L = λ_lm * L_lm
 - 当前 `VGGTUpsampler` 仍然是接口骨架，但构造方式已经兼容原始 `AuxSeparateHeads`
 - 当前实现优先保证单图 / 单视频 / 多媒体顺序输入可跑通
 - aux 阶段 checkpoint 中：
-  - 标准 adapter 文件保存 LoRA
+  - 开启 LoRA 时，标准 adapter 文件保存 LoRA
+  - `QWEN3VL_AUX_DISABLE_LORA=1` 时不生成 adapter 文件
   - `vit.safetensors` 保存 ViT/aligner 全参训练结果
   - `aux_trainables.safetensors` 只保存 aux head / aux loss 相关权重
-- 如果要把辅助训练结果用于后续 LM 自回归训练，先运行 `merge_aux_to_lm.sh`；该流程会加载 LoRA 和 `vit.safetensors`，合并 LoRA 后保存普通模型权重，且不带 aux head
+- Aux Head warmup 后做 LM + Aux 联合训练时，不需要 merge。第二阶段用基础模型正常初始化 LoRA，并设置 `QWEN3VL_AUX_INIT_HEADS_FROM=/path/to/stage1/checkpoint` 加载第一阶段 aux 权重
+- 第一阶段与第二阶段的可训练参数拓扑不同，因此第二阶段不要把第一阶段目录传给 `--resume_from_checkpoint`
+- 只有需要输出不带 aux head 的普通 LM 模型时，才运行 `merge_aux_to_lm.sh`
 - 你后续只需要补齐这几个接口的具体实现：
   - `aux_task/bev/bev_aux_head.py`, `aux_task/bev/bev_aux_loss.py`
   - `aux_task/cog/cog_aux_head.py`, `aux_task/cog/cog_aux_loss.py`

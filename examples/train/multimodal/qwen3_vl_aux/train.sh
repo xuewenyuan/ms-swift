@@ -1,6 +1,7 @@
 QWEN3VL_AUX_CONFIG_PATH=examples/train/multimodal/qwen3_vl_aux/config.example.json \
 QWEN3VL_AUX_HEAD_LR=5e-4 \
 QWEN3VL_AUX_LM_WEIGHT=0 \
+QWEN3VL_AUX_DISABLE_LORA=1 \
 MAX_PIXELS=1003520 \
 swift sft \
     --model Qwen/Qwen3-VL-4B-Instruct \
@@ -16,8 +17,6 @@ swift sft \
     --per_device_eval_batch_size 1 \
     --gradient_accumulation_steps 4 \
     --learning_rate 1e-4 \
-    --vit_lr 1e-5 \
-    --aligner_lr 1e-5 \
     --lora_rank 16 \
     --lora_alpha 32 \
     --eval_steps 100 \
