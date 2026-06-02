@@ -65,6 +65,13 @@ def _canonical_aux_parameter_name(name: str) -> Optional[str]:
     return None
 
 
+def _summarize_keys(keys: Sequence[str], limit: int = 20) -> str:
+    keys = list(keys)
+    if len(keys) <= limit:
+        return str(keys)
+    return f'{keys[:limit]} ... ({len(keys)} keys total)'
+
+
 def _is_adapter_parameter_name(name: str) -> bool:
     return any(keyword in name for keyword in ADAPTER_PARAMETER_KEYWORDS)
 
@@ -275,21 +282,55 @@ def _load_aux_trainables(model: nn.Module, model_id: str, *, required: bool = Fa
             raise FileNotFoundError(f'Missing auxiliary trainables: {aux_weights_path}')
         return
     state_dict = safetensors.torch.load_file(aux_weights_path)
-    canonical_state_dict = {}
+    module_state_dicts = {module_name: {} for module_name in AUX_MODULE_KEYWORDS}
+    ignored_keys = []
     for name, value in state_dict.items():
         canonical_name = _canonical_aux_parameter_name(name)
         if canonical_name is None:
-            logger.warning(f'Ignoring non-auxiliary key in {aux_weights_path}: {name}')
+            ignored_keys.append(name)
             continue
-        canonical_state_dict[canonical_name] = value
+        if '.' not in canonical_name:
+            ignored_keys.append(name)
+            continue
+        module_name, parameter_name = canonical_name.split('.', 1)
+        module_state_dicts[module_name][parameter_name] = value
     target_model = get_target_model(model)
-    missing, unexpected = target_model.load_state_dict(canonical_state_dict, strict=False)
-    missing_aux = [name for name in missing if _is_aux_parameter_name(name)]
-    logger.info(f'Loaded auxiliary trainables from {aux_weights_path}.')
-    if missing_aux:
-        logger.warning(f'Missing auxiliary keys when loading trainables: {missing_aux}')
-    if unexpected:
-        logger.warning(f'Unexpected keys when loading auxiliary trainables: {unexpected}')
+    loaded_key_count = 0
+    for module_name, module_state_dict in module_state_dicts.items():
+        module = getattr(target_model, module_name, None)
+        if module is None:
+            if module_state_dict:
+                ignored_keys.extend(f'{module_name}.{name}' for name in module_state_dict)
+            continue
+        missing, unexpected = module.load_state_dict(module_state_dict, strict=False)
+        loaded_key_count += len(module_state_dict) - len(unexpected)
+        if missing:
+            missing = [f'{module_name}.{name}' for name in missing]
+            logger.warning(f'Missing auxiliary keys when loading trainables: {_summarize_keys(missing)}')
+        if unexpected:
+            unexpected = [f'{module_name}.{name}' for name in unexpected]
+            logger.warning(f'Unexpected keys when loading auxiliary trainables: {_summarize_keys(unexpected)}')
+    if ignored_keys:
+        logger.warning(f'Ignored non-auxiliary keys in {aux_weights_path}: {_summarize_keys(ignored_keys)}')
+    if required and not loaded_key_count:
+        raise RuntimeError(f'No auxiliary trainables were loaded from {aux_weights_path}.')
+    logger.info(f'Loaded {loaded_key_count} auxiliary tensors from {aux_weights_path}.')
+
+
+def _collect_aux_state_dict(target_model: nn.Module, state_dict: Mapping[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    aux_state_dict = {}
+    for name, value in state_dict.items():
+        canonical_name = _canonical_aux_parameter_name(name)
+        if canonical_name is not None:
+            aux_state_dict[canonical_name] = value.detach().cpu().contiguous()
+    for module_name in AUX_MODULE_KEYWORDS:
+        module = getattr(target_model, module_name, None)
+        if module is None:
+            continue
+        for name, value in module.state_dict().items():
+            canonical_name = f'{module_name}.{name}'
+            aux_state_dict.setdefault(canonical_name, value.detach().cpu().contiguous())
+    return aux_state_dict
 
 
 def _load_vit_trainables(model: nn.Module, model_id: str) -> None:
@@ -638,12 +679,7 @@ class Qwen3VLAuxTuner(Tuner):
         with open(os.path.join(save_directory, AUX_HEAD_CONFIG), 'w', encoding='utf-8') as f:
             json.dump(aux_config, f, ensure_ascii=False, indent=2)
 
-        aux_state_dict = {}
-        for name, value in state_dict.items():
-            if name in trainable_parameter_names and _is_aux_parameter_name(name):
-                canonical_name = _canonical_aux_parameter_name(name)
-                if canonical_name is not None:
-                    aux_state_dict[canonical_name] = value
+        aux_state_dict = _collect_aux_state_dict(target_model, state_dict)
         if aux_state_dict:
             safetensors.torch.save_file(
                 aux_state_dict, os.path.join(save_directory, AUX_TRAINABLES), metadata={'format': 'pt'})
